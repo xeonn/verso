@@ -1,380 +1,163 @@
-use crate::verso::send_to_constellation;
+//! Native menus for Servo's context menu and `<select>` controls.
+//!
+//! **Platform Specific**
+//! - macOS / Windows: a native menu built with the muda crate. Showing it blocks until the user
+//!   picks an item or dismisses the menu.
+//! - Linux: winit has no popup surface yet, so the control is dismissed and Servo keeps its
+//!   current state.
+
+use servo::{ContextMenu, SelectElement, WebViewId};
+
 use crate::window::Window;
-use base::generic_channel::GenericSender;
-use constellation_traits::{EmbedderToConstellationMessage, TraversalDirection};
-#[cfg(linux)]
-use embedder_traits::ViewportDetails;
-use embedder_traits::{ContextMenuResult, TraversalId};
 
-/* macOS, Windows Native Implementation */
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-use crossbeam_channel::Sender;
+use muda::{
+    ContextMenu as _, Menu, MenuItem, PredefinedMenuItem,
+    dpi::{LogicalPosition, Position},
+};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-use muda::MenuEvent;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use muda::{ContextMenu as MudaContextMenu, Menu as MudaMenu};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use servo::{ContextMenuItem, SelectElementOptionOrOptgroup};
 
-/* Wayland Implementation */
-#[cfg(linux)]
-use super::webview_menu::WebViewMenu;
-#[cfg(linux)]
-use crate::webview::WebView;
-#[cfg(linux)]
-use base::id::WebViewId;
-#[cfg(linux)]
-use crossbeam_channel::Sender;
-#[cfg(linux)]
-use serde::{Deserialize, Serialize};
-#[cfg(linux)]
-use servo_url::ServoUrl;
-#[cfg(linux)]
-use url::Url;
-#[cfg(linux)]
-use webrender_api::units::DeviceRect;
-#[cfg(linux)]
-use winit::dpi::LogicalPosition;
-
-/// Basic menu type building block
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-pub struct Menu(pub MudaMenu);
-/// Basic menu type building block
-#[cfg(linux)]
-#[derive(Debug, Clone)]
-pub struct Menu(pub Vec<MenuItem>);
-
-/// The Context Menu of the Window. It will be opened when users right click on any window's
-/// webview.
-///
-/// **Platform Specific**
-/// - macOS / Windows: This will be native context menu supported by each OS.
-/// - Wayland: Winit doesn't support popup surface of Wayland at the moment. So we utilize a custom
-///   webview implementation.
-#[derive(Clone)]
-pub struct ContextMenu {
-    /// IpcSender to send the context menu result to the Servo
-    servo_result_sender: Option<GenericSender<ContextMenuResult>>, // None if sender already sent
+impl Window {
+    /// Show Servo's context menu and send the chosen action back to Servo.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    menu: MudaMenu,
-    #[cfg(linux)]
-    menu_items: Vec<MenuItem>,
-    /// The webview that the context menu is attached to
-    #[cfg(linux)]
-    pub(crate) webview: WebView,
-    /// Menu position, used for positioning the context menu by CSS
-    #[cfg(linux)]
-    position: LogicalPosition<f64>,
-}
-
-impl ContextMenu {
-    /// Create context menu with custom items
-    ///
-    /// **Platform Specific**
-    /// - macOS / Windows: Creates a context menu by muda crate with natvie OS support
-    /// - Wayland: Creates a context menu with webview implementation
-    pub fn new_with_menu(
-        servo_result_sender: GenericSender<ContextMenuResult>,
-        menu: Menu,
-    ) -> Self {
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
-            Self {
-                servo_result_sender: Some(servo_result_sender),
-                menu: menu.0,
+    pub(crate) fn show_context_menu(&self, context_menu: ContextMenu) {
+        let menu = Menu::new();
+        let mut actions = Vec::new();
+        for (index, item) in context_menu.items().iter().enumerate() {
+            match item {
+                ContextMenuItem::Item {
+                    label,
+                    action,
+                    enabled,
+                } => {
+                    let id = format!("verso-context-menu-{index}");
+                    let _ = menu.append(&MenuItem::with_id(id.clone(), label, *enabled, None));
+                    actions.push((id, *action));
+                },
+                ContextMenuItem::Separator => {
+                    let _ = menu.append(&PredefinedMenuItem::separator());
+                },
             }
         }
-        #[cfg(linux)]
-        {
-            let webview_id = WebViewId::new();
-            let webview = WebView::new(webview_id, ViewportDetails::default());
 
-            Self {
-                servo_result_sender: Some(servo_result_sender),
-                menu_items: menu.0,
-                webview,
-                position: LogicalPosition::new(0.0, 0.0),
+        // Open at the cursor, like a native context menu.
+        self.show_native_menu(&menu, None);
+        match self.take_menu_selection(|id| actions.iter().find(|(item, _)| item == id)) {
+            Some((_, action)) => context_menu.select(*action),
+            None => context_menu.dismiss(),
+        }
+    }
+
+    /// Show the options of a `<select>` element and submit the chosen one to Servo.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub(crate) fn show_select_element(&self, webview_id: WebViewId, mut select: SelectElement) {
+        let menu = Menu::new();
+        let selected = select.selected_options();
+        let mut options = Vec::new();
+        let mut append_option = |menu: &Menu, id: usize, label: &str, disabled: bool| {
+            let menu_id = format!("verso-select-{id}");
+            let label = if selected.contains(&id) {
+                format!("✓ {label}")
+            } else {
+                label.to_owned()
+            };
+            let _ = menu.append(&MenuItem::with_id(menu_id.clone(), label, !disabled, None));
+            options.push((menu_id, id));
+        };
+        for entry in select.options() {
+            match entry {
+                SelectElementOptionOrOptgroup::Option(option) => {
+                    append_option(&menu, option.id, &option.label, option.is_disabled);
+                },
+                SelectElementOptionOrOptgroup::Optgroup { label, options } => {
+                    let _ = menu.append(&MenuItem::new(label, false, None));
+                    for option in options {
+                        append_option(&menu, option.id, &option.label, option.is_disabled);
+                    }
+                },
             }
         }
+
+        // Open below the `<select>` element.
+        let rect = select.position();
+        let origin = self.webview_origin(webview_id);
+        let scale = self.scale_factor();
+        let position = Position::Logical(LogicalPosition::new(
+            (rect.min.x + origin.x) as f64 / scale,
+            (rect.max.y + origin.y) as f64 / scale,
+        ));
+        self.show_native_menu(&menu, Some(position));
+        // Dropping the control without submitting keeps the current selection.
+        let Some((_, id)) = self.take_menu_selection(|menu_id| {
+            options.iter().find(|(item, _)| item == menu_id)
+        }) else {
+            return;
+        };
+        let id = *id;
+        let new_selection = if select.allow_select_multiple() {
+            let mut current = selected;
+            if let Some(index) = current.iter().position(|option| *option == id) {
+                current.remove(index);
+            } else {
+                current.push(id);
+            }
+            current
+        } else {
+            vec![id]
+        };
+        select.select(new_selection);
+        select.submit();
     }
 
-    /// Send the context menu result back to the Servo. Can only be sent once.
-    pub fn send_result_to_servo(&mut self, result: ContextMenuResult) {
-        if let Some(sender) = self.servo_result_sender.take() {
-            let _ = sender.send(result);
-        }
-    }
-}
+    /// Pop up `menu` at `position` in the window, or at the cursor when it is `None`.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn show_native_menu(&self, menu: &Menu, position: Option<Position>) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-impl Drop for ContextMenu {
-    fn drop(&mut self) {
-        self.send_result_to_servo(ContextMenuResult::Dismissed);
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-impl ContextMenu {
-    /// Show the context menu on current cursor position
-    ///
-    /// This function returns when the context menu is dismissed
-    pub fn show(&self, rwh: impl HasWindowHandle) {
-        // Show the context menu
+        let Ok(handle) = self.window.window_handle() else {
+            return;
+        };
         unsafe {
-            let wh = rwh.window_handle().unwrap();
-            match wh.as_raw() {
+            match handle.as_raw() {
                 #[cfg(target_os = "macos")]
                 RawWindowHandle::AppKit(handle) => {
-                    // use objc2
-                    assert!(
-                        objc2_foundation::is_main_thread(),
-                        "can only access AppKit handles on the main thread"
-                    );
-                    let ns_view = handle.ns_view.as_ptr();
-                    self.menu.show_context_menu_for_nsview(ns_view, None);
-                }
+                    menu.show_context_menu_for_nsview(handle.ns_view.as_ptr(), position);
+                },
                 #[cfg(target_os = "windows")]
                 RawWindowHandle::Win32(handle) => {
-                    let hwnd = handle.hwnd;
-                    self.menu.show_context_menu_for_hwnd(hwnd.into(), None);
-                }
-                handle => unreachable!("unknown handle {handle:?} for platform"),
+                    menu.show_context_menu_for_hwnd(handle.hwnd.into(), position);
+                },
+                handle => log::error!("Unsupported window handle for a native menu: {handle:?}"),
             }
         }
     }
-}
 
-#[cfg(linux)]
-impl WebViewMenu for ContextMenu {
-    /// Get webview of the context menu
-    fn webview(&self) -> &WebView {
-        &self.webview
-    }
-
-    /// Get resource URL of the context menu
-    fn resource_url(&self) -> ServoUrl {
-        let mut url = Url::parse("verso://resources/components/context_menu.html").unwrap();
-        url.query_pairs_mut()
-            .append_pair("items", &self.serialize_items());
-        url.query_pairs_mut()
-            .append_pair("pos_x", &self.position.x.to_string());
-        url.query_pairs_mut()
-            .append_pair("pos_y", &self.position.y.to_string());
-        ServoUrl::from_url(url)
-    }
-
-    fn set_webview_rect(&mut self, rect: DeviceRect) {
-        self.webview.set_size(rect);
-    }
-
-    fn position(&self) -> LogicalPosition<f64> {
-        self.position
-    }
-
-    fn set_position(&mut self, position: LogicalPosition<f64>) {
-        self.position = position;
-    }
-
-    fn close(&mut self, sender: &Sender<EmbedderToConstellationMessage>) {
-        self.send_result_to_servo(ContextMenuResult::Dismissed);
-        send_to_constellation(
-            sender,
-            EmbedderToConstellationMessage::CloseWebView(self.webview().webview_id),
-        );
-    }
-}
-
-#[cfg(linux)]
-impl ContextMenu {
-    /// Convert the context menu items to JSON string
-    fn serialize_items(&self) -> String {
-        serde_json::to_string(&self.menu_items).unwrap()
-    }
-}
-
-/// Menu Item
-#[cfg(linux)]
-#[derive(Debug, Clone, Serialize)]
-pub struct MenuItem {
-    id: String,
-    /// label of the menu item
-    pub label: String,
-    /// Whether the menu item is enabled
-    pub enabled: bool,
-}
-
-#[cfg(linux)]
-impl MenuItem {
-    /// Create a new menu item
-    pub fn new(id: Option<&str>, label: &str, enabled: bool) -> Self {
-        let id = id.unwrap_or(label);
-        Self {
-            id: id.to_string(),
-            label: label.to_string(),
-            enabled,
-        }
-    }
-    /// Get the id of the menu item
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-}
-
-/// Context Menu Click Result
-#[cfg(linux)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-
-pub struct ContextMenuUIResponse {
-    /// The id of the menu item
-    pub id: Option<String>,
-    /// Close the context menu
-    pub close: bool,
-}
-
-// Context Menu methods
-impl Window {
+    /// Find the menu item the user clicked, if any, among the events queued while the menu was open.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub(crate) fn show_context_menu(
+    fn take_menu_selection<'a, T>(
         &self,
-        servo_sender: GenericSender<ContextMenuResult>,
-    ) -> ContextMenu {
-        use muda::MenuItem;
-
-        let tab = self.tab_manager.current_tab().unwrap();
-        let history = tab.history();
-        let history_len = history.list.len();
-
-        // items
-        let back = MenuItem::with_id("back", "Back", history.current_idx > 0, None);
-        let forward = MenuItem::with_id(
-            "forward",
-            "Forward",
-            history.current_idx + 1 < history_len,
-            None,
-        );
-        let reload = MenuItem::with_id("reload", "Reload", true, None);
-
-        let menu = MudaMenu::new();
-        let _ = menu.append_items(&[&back, &forward, &reload]);
-
-        let context_menu = ContextMenu::new_with_menu(servo_sender, Menu(menu));
-        context_menu.show(self.window.window_handle().unwrap());
-
-        context_menu
-    }
-
-    #[cfg(linux)]
-    pub(crate) fn show_context_menu(
-        &mut self,
-        sender: &Sender<EmbedderToConstellationMessage>,
-        servo_sender: GenericSender<ContextMenuResult>,
-    ) -> ContextMenu {
-        let tab = self.tab_manager.current_tab().unwrap();
-        let history = tab.history();
-        let history_len = history.list.len();
-
-        // items
-        let back = MenuItem::new(Some("back"), "Back", history.current_idx > 0);
-        let forward = MenuItem::new(
-            Some("forward"),
-            "Forward",
-            history.current_idx + 1 < history_len,
-        );
-        let reload = MenuItem::new(Some("reload"), "Reload", true);
-
-        let mut context_menu =
-            ContextMenu::new_with_menu(servo_sender, Menu(vec![back, forward, reload]));
-
-        let position = self.mouse_position.get().unwrap();
-        context_menu.show(sender, self, position);
-
-        context_menu
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub(crate) fn handle_context_menu_event(
-        &self,
-        mut context_menu: ContextMenu,
-        sender: &Sender<EmbedderToConstellationMessage>,
-        event: MenuEvent,
-    ) {
-        context_menu.send_result_to_servo(ContextMenuResult::Dismissed);
-        // TODO: should be more flexible to handle different menu items
-        let active_tab = self.tab_manager.current_tab().unwrap();
-        match event.id().0.as_str() {
-            "back" => {
-                send_to_constellation(
-                    sender,
-                    EmbedderToConstellationMessage::TraverseHistory(
-                        active_tab.id(),
-                        TraversalDirection::Back(1),
-                        TraversalId::new(),
-                    ),
-                );
+        find: impl Fn(&str) -> Option<&'a T>,
+    ) -> Option<&'a T> {
+        let mut found = None;
+        while let Ok(event) = self.menu_event_receiver.try_recv() {
+            if found.is_none() {
+                found = find(event.id().0.as_str());
             }
-            "forward" => {
-                send_to_constellation(
-                    sender,
-                    EmbedderToConstellationMessage::TraverseHistory(
-                        active_tab.id(),
-                        TraversalDirection::Forward(1),
-                        TraversalId::new(),
-                    ),
-                );
-            }
-            "reload" => {
-                send_to_constellation(
-                    sender,
-                    EmbedderToConstellationMessage::Reload(active_tab.id()),
-                );
-            }
-            _ => {}
         }
+        found
     }
 
-    /// Handle linux context menu event
-    // TODO(context-menu): should make the call in synchronous way after calling show_context_menu, otherwise
-    // we'll have to deal with constellation sender and other parameter's lifetime, also we lose the context that why this context menu popup
-    #[cfg(linux)]
-    pub(crate) fn handle_context_menu_event(
-        &mut self,
-        sender: &Sender<EmbedderToConstellationMessage>,
-        event: crate::webview::context_menu::ContextMenuUIResponse,
-    ) {
-        self.close_webview_menu(sender);
-        if let Some(id) = event.id {
-            if let Some(tab_id) = self.tab_manager.current_tab_id() {
-                match id.as_str() {
-                    "back" => {
-                        send_to_constellation(
-                            sender,
-                            EmbedderToConstellationMessage::TraverseHistory(
-                                tab_id,
-                                TraversalDirection::Back(1),
-                                TraversalId::new(),
-                            ),
-                        );
-                    }
-                    "forward" => {
-                        send_to_constellation(
-                            sender,
-                            EmbedderToConstellationMessage::TraverseHistory(
-                                tab_id,
-                                TraversalDirection::Forward(1),
-                                TraversalId::new(),
-                            ),
-                        );
-                    }
-                    "reload" => {
-                        send_to_constellation(
-                            sender,
-                            EmbedderToConstellationMessage::Reload(tab_id),
-                        );
-                    }
-                    _ => {}
-                }
-            } else {
-                log::error!("No active webview to handle context menu event");
-            }
-        };
+    /// Context menus need a popup surface, which winit does not offer on Linux yet.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    pub(crate) fn show_context_menu(&self, context_menu: ContextMenu) {
+        log::debug!("Context menus are not supported on this platform yet");
+        context_menu.dismiss();
+    }
+
+    /// `<select>` popups need a popup surface, which winit does not offer on Linux yet.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    pub(crate) fn show_select_element(&self, _webview_id: WebViewId, _select: SelectElement) {
+        log::debug!("Select popups are not supported on this platform yet");
     }
 }

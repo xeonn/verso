@@ -1,45 +1,29 @@
-use std::{cell::Cell, collections::HashMap, ops::Deref, rc::Rc};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    rc::{Rc, Weak},
+};
 
-use base::{generic_channel::GenericSender, id::WebViewId};
-use constellation_traits::EmbedderToConstellationMessage;
-use crossbeam_channel::Sender;
-use embedder_traits::{
-    AlertResponse, AllowOrDeny, ConfirmResponse, Cursor, EmbedderMsg, ImeEvent, InputEvent,
-    MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent,
-    Notification, PromptResponse, ScreenMetrics, TouchEventType, ViewportDetails,
-    WebResourceResponseMsg, WheelMode,
-};
-use euclid::{Point2D, Scale, Size2D};
-use ipc_channel::ipc::IpcSender;
-use keyboard_types::{
-    Code, CompositionEvent, CompositionState, KeyState, KeyboardEvent, Modifiers,
-};
+use euclid::Scale;
+use keyboard_types::{Code, KeyState, KeyboardEvent, Modifiers};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use muda::{MenuEvent, MenuEventReceiver};
-#[cfg(linux)]
-use notify_rust::Image;
-#[cfg(target_os = "macos")]
-use raw_window_handle::HasWindowHandle;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use serde::{Deserialize, Serialize};
 use servo::{
-    LoadStatus, RenderingContext, Scroll, Servo, WebViewBuilder, WebViewDelegate,
-    WindowRenderingContext,
+    AllowOrDenyRequest, AuthenticationRequest, Cursor, DeviceIndependentPixel, DeviceIntRect,
+    DevicePixel, DevicePoint, DeviceVector2D, EmbedderControl, EmbedderControlId, FilePicker,
+    InputEvent, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
+    MouseLeftViewportEvent, MouseMoveEvent, NavigationRequest, Notification,
+    OffscreenRenderingContext, PermissionRequest, RenderingContext, Scroll, SimpleDialog,
+    WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WebViewId, WindowRenderingContext,
 };
-use servo_geometry::{convert_rect_to_css_pixel, convert_size_to_css_pixel};
-use servo_url::ServoUrl;
 use versoview_messages::ToControllerMessage;
-use webrender_api::{
-    ScrollLocation,
-    units::{
-        DeviceIntPoint, DeviceIntRect, DevicePixel, DevicePoint, DeviceRect, DeviceSize,
-        DeviceVector2D, LayoutVector2D,
-    },
-};
 #[cfg(any(linux, target_os = "windows"))]
 use winit::window::ResizeDirection;
 use winit::{
-    dpi::{LogicalPosition, LogicalSize, PhysicalPosition},
-    event::{ElementState, Ime, TouchPhase, WindowEvent},
+    dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
+    event::{ElementState, WindowEvent},
     event_loop::ActiveEventLoop,
     keyboard::ModifiersState,
     window::{CursorIcon, Window as WinitWindow, WindowAttributes, WindowId},
@@ -47,17 +31,13 @@ use winit::{
 
 use crate::{
     Verso,
-    bookmark::BookmarkManager,
     keyboard::keyboard_event_from_winit,
     tab::TabManager,
-    verso::send_to_constellation,
     webview::{
         Panel,
-        // prompt::PromptSender, webview_menu::WebViewMenu
+        prompt::{PROMPT_LOGICAL_SIZE, PendingPrompt, Prompt},
     },
 };
-
-use arboard::Clipboard;
 
 const PANEL_HEIGHT: f64 = 50.0;
 const TAB_HEIGHT: f64 = 30.0;
@@ -68,9 +48,10 @@ const PANEL_PADDING: f64 = 4.0;
 pub(crate) struct EventListeners {
     /// This is `true` if the controller wants to get and handle OnNavigationStarting/AllowNavigationRequest
     pub(crate) on_navigation_starting: bool,
-    /// An id to request response sender map if the controller wants to get and handle web resource requests
-    pub(crate) on_web_resource_requested:
-        Option<HashMap<uuid::Uuid, (url::Url, GenericSender<WebResourceResponseMsg>)>>,
+    /// Navigation requests waiting for a controller response.
+    pub(crate) pending_navigations: HashMap<uuid::Uuid, NavigationRequest>,
+    /// Pending web resource loads waiting for a controller response.
+    pub(crate) on_web_resource_requested: Option<HashMap<uuid::Uuid, WebResourceLoad>>,
     /// This is `true` if the controller wants to get and handle WindowEvent::CloseRequested
     pub(crate) on_close_requested: bool,
 }
@@ -82,18 +63,52 @@ struct CursorState {
     cursor_resizing: bool,
 }
 
+/// The tab id format `panel.html` compares: `{ namespace_id, index }`.
+///
+/// Servo 0.7.0 serializes [`WebViewId`] as `[painter_id, { namespace_id, index }]`, which the
+/// panel cannot match, so Verso hands the panel its own ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct PanelTabId {
+    namespace_id: u32,
+    index: u32,
+}
+
+impl PanelTabId {
+    fn to_json(self) -> String {
+        serde_json::to_string(&self).unwrap_or_default()
+    }
+}
+
+/// A region of the window that Servo paints into its own framebuffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Region {
+    Panel,
+    Content,
+    Prompt,
+}
+
 /// A Verso window is a Winit window containing several web views.
 pub struct Window {
-    /// Access to Winit window
-    pub(crate) window: WinitWindow,
     cursor_state: CursorState,
-    // /// GL surface of the window
-    // pub(crate) surface: Surface<WindowSurface>,
     pub(crate) rendering_context: Rc<WindowRenderingContext>,
+    /// Framebuffer of the panel webview.
+    panel_context: Option<Rc<OffscreenRenderingContext>>,
+    /// Framebuffer shared by every tab. Servo uses one painter per rendering context, and
+    /// `WebView::show` / `hide` select the tab it draws.
+    content_context: Option<Rc<OffscreenRenderingContext>>,
+    /// Regions with a new Servo frame that has not been painted yet.
+    panel_dirty: Cell<bool>,
+    content_dirty: Cell<bool>,
+    prompt_dirty: Cell<bool>,
     /// The main panel of this window.
     pub(crate) panel: Option<Panel>,
-    /// The WebView of this window.
-    // pub(crate) webview: Option<WebView>,
+    /// The prompt page shown over the content area, if any.
+    prompt: Option<Prompt>,
+    /// Ids handed to the panel for each tab.
+    panel_tab_ids: HashMap<WebViewId, PanelTabId>,
+    next_panel_tab_index: u32,
+    /// The input method control that currently owns the IME.
+    ime_control: Option<EmbedderControlId>,
     /// Event listeners registered from the webview controller
     pub(crate) event_listeners: EventListeners,
     /// The mouse physical position in the web view.
@@ -110,83 +125,237 @@ pub struct Window {
     /// Window tabs manager
     pub(crate) tab_manager: TabManager,
     pub(crate) focused_webview_id: Option<WebViewId>,
-    // /// Window-wide menu. e.g. context menu(Wayland) and browsing history menu.
-    // pub(crate) webview_menu: Option<Box<dyn WebViewMenu>>,
     /// Show the bookmark bar or not
     pub show_bookmark: bool,
+    /// Access to Winit window.
+    ///
+    /// Declared last so it is dropped after the GL surfaces that render into it.
+    pub(crate) window: WinitWindow,
 }
 
-macro_rules! window {
-    ($self:ident) => {
-        $self.verso.windows.borrow().get(&$self.window_id).unwrap()
-    };
-}
-
-macro_rules! window_mut {
-    ($self:ident) => {
-        $self
-            .verso
-            .windows
-            .borrow_mut()
-            .get_mut(&$self.window_id)
-            .unwrap()
-    };
-}
+/// Delegate for the tabs of a window.
+///
+/// It holds a [`Weak`] reference: [`Verso`] owns the windows, the windows own the webviews, and
+/// the webviews own their delegates. A strong reference would keep `Servo` alive forever, and
+/// Servo 0.7.0 only shuts down when its last handle is dropped.
 struct WindowWebViewDelegate {
-    verso: Rc<Verso>,
+    verso: Weak<Verso>,
     window_id: WindowId,
 }
 
-impl WebViewDelegate for WindowWebViewDelegate {
-    fn notify_closed(&self, webview: servo::WebView) {
-        self.verso
-            .windows
-            .borrow_mut()
-            .get_mut(&self.window_id)
-            .unwrap()
-            .close_tab(webview.id());
+impl WindowWebViewDelegate {
+    fn new(verso: &Rc<Verso>, window_id: WindowId) -> Self {
+        Self {
+            verso: Rc::downgrade(verso),
+            window_id,
+        }
+    }
+
+    /// Run `callback` on this delegate's window. Does nothing once Verso or the window is gone.
+    fn with_window<R>(&self, callback: impl FnOnce(&mut Window, &Rc<Verso>) -> R) -> Option<R> {
+        let verso = self.verso.upgrade()?;
+        let Ok(mut windows) = verso.windows.try_borrow_mut() else {
+            log::warn!("Verso windows are busy; dropping a webview delegate callback");
+            return None;
+        };
+        let window = windows.get_mut(&self.window_id)?;
+        Some(callback(window, &verso))
+    }
+
+    fn forward_web_resource(&self, load: WebResourceLoad) {
+        let Some(verso) = self.verso.upgrade() else {
+            return;
+        };
+        let Some(sender) = verso.controller_sender() else {
+            return;
+        };
+        let mut windows = verso.windows.borrow_mut();
+        let Some(window) = windows.get_mut(&self.window_id) else {
+            return;
+        };
+        let Some(pending) = window.event_listeners.on_web_resource_requested.as_mut() else {
+            return;
+        };
+
+        let id = uuid::Uuid::new_v4();
+        let resource = load.request();
+        let mut builder = http::request::Builder::new()
+            .uri(resource.url.as_str())
+            .method(resource.method.clone());
+        for (key, value) in resource.headers.iter() {
+            builder = builder.header(key, value);
+        }
+        let http_request = match builder.body(Vec::new()) {
+            Ok(request) => request,
+            Err(error) => {
+                log::debug!("Skipping a web resource the controller cannot see: {error}");
+                return;
+            },
+        };
+        if sender
+            .send(ToControllerMessage::OnWebResourceRequested(
+                versoview_messages::WebResourceRequest {
+                    id,
+                    request: http_request,
+                },
+            ))
+            .is_ok()
+        {
+            pending.insert(id, load);
+        }
     }
 }
 
+impl WebViewDelegate for WindowWebViewDelegate {
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        self.with_window(|window, _| window.mark_dirty(webview.id()));
+    }
+
+    fn notify_closed(&self, webview: WebView) {
+        self.with_window(|window, _| window.close_tab(webview.id()));
+    }
+
+    fn notify_history_changed(&self, webview: WebView, _entries: Vec<url::Url>, _current: usize) {
+        self.with_window(|window, _| window.update_navbar(webview.id()));
+    }
+
+    fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
+        self.with_window(|window, _| window.set_tab_title(webview.id(), title));
+    }
+
+    fn notify_cursor_changed(&self, _webview: WebView, cursor: Cursor) {
+        self.with_window(|window, _| window.set_cursor_icon(cursor));
+    }
+
+    fn request_navigation(&self, _webview: WebView, request: NavigationRequest) {
+        let request = self.with_window(|window, verso| {
+            window.defer_navigation_to_controller(verso, request)
+        });
+        // Allow when there is no window or no controller listening.
+        if let Some(Some(request)) = request {
+            request.allow();
+        }
+    }
+
+    fn request_unload(&self, _webview: WebView, request: AllowOrDenyRequest) {
+        request.allow();
+    }
+
+    fn request_permission(&self, webview: WebView, request: PermissionRequest) {
+        self.with_window(|window, verso| {
+            window.show_prompt(verso, webview.id(), None, PendingPrompt::Permission(request))
+        });
+    }
+
+    fn request_authentication(&self, webview: WebView, request: AuthenticationRequest) {
+        self.with_window(|window, verso| {
+            window.show_prompt(
+                verso,
+                webview.id(),
+                None,
+                PendingPrompt::Authentication(request),
+            )
+        });
+    }
+
+    fn show_embedder_control(&self, webview: WebView, control: EmbedderControl) {
+        self.with_window(|window, verso| {
+            window.present_embedder_control(verso, webview.id(), control)
+        });
+    }
+
+    fn hide_embedder_control(&self, _webview: WebView, control_id: EmbedderControlId) {
+        self.with_window(|window, _| window.hide_embedder_control(control_id));
+    }
+
+    fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+        self.forward_web_resource(load);
+    }
+}
+
+/// Delegate for the panel webview.
 struct PanelWebViewDelegate(WindowWebViewDelegate);
 
-impl Deref for PanelWebViewDelegate {
-    type Target = WindowWebViewDelegate;
+impl WebViewDelegate for PanelWebViewDelegate {
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        self.0.with_window(|window, _| window.mark_dirty(webview.id()));
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    fn notify_cursor_changed(&self, _webview: WebView, cursor: Cursor) {
+        self.0.with_window(|window, _| window.set_cursor_icon(cursor));
+    }
+
+    fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+        if status == LoadStatus::Complete {
+            self.0.with_window(|window, verso| window.finish_panel_load(verso));
+        }
+    }
+
+    fn show_embedder_control(&self, webview: WebView, control: EmbedderControl) {
+        self.0.with_window(|window, verso| {
+            window.present_panel_control(verso, webview.id(), control)
+        });
+    }
+
+    fn hide_embedder_control(&self, _webview: WebView, control_id: EmbedderControlId) {
+        self.0
+            .with_window(|window, _| window.hide_embedder_control(control_id));
+    }
+
+    fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+        self.0.forward_web_resource(load);
     }
 }
 
-impl WebViewDelegate for PanelWebViewDelegate {
-    fn notify_load_status_changed(&self, webview: servo::WebView, status: servo::LoadStatus) {
-        match status {
-            LoadStatus::Started | LoadStatus::HeadParsed => {
-                webview.notify_theme_change(to_servo_theme(window!(self).window.theme().as_ref()));
-            }
-            LoadStatus::Complete => {
-                window!(self).window.request_redraw();
-                window_mut!(self).create_tab(
-                    &self.verso,
-                    window!(self).panel.as_ref().unwrap().initial_url.clone(),
-                );
-            }
+/// Delegate for a prompt page shown over the content area.
+struct PromptWebViewDelegate(WindowWebViewDelegate);
+
+impl WebViewDelegate for PromptWebViewDelegate {
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        self.0.with_window(|window, _| window.mark_dirty(webview.id()));
+    }
+
+    fn notify_cursor_changed(&self, _webview: WebView, cursor: Cursor) {
+        self.0.with_window(|window, _| window.set_cursor_icon(cursor));
+    }
+
+    /// The prompt pages send their result with `window.alert(result)`.
+    fn show_embedder_control(&self, webview: WebView, control: EmbedderControl) {
+        match control {
+            EmbedderControl::SimpleDialog(SimpleDialog::Alert(alert)) => {
+                let result = alert.message().to_owned();
+                alert.confirm();
+                self.0
+                    .with_window(|window, _| window.finish_prompt(webview.id(), Some(&result)));
+            },
+            EmbedderControl::InputMethod(input) => {
+                self.0.with_window(|window, verso| {
+                    window.present_embedder_control(
+                        verso,
+                        webview.id(),
+                        EmbedderControl::InputMethod(input),
+                    )
+                });
+            },
+            other => log::debug!("Ignoring {:?} from a prompt page", other.id()),
         }
+    }
+
+    fn hide_embedder_control(&self, _webview: WebView, control_id: EmbedderControlId) {
+        self.0
+            .with_window(|window, _| window.hide_embedder_control(control_id));
+    }
+
+    /// The prompt pages call `window.close()` after sending their result.
+    fn notify_closed(&self, webview: WebView) {
+        self.0
+            .with_window(|window, _| window.finish_prompt(webview.id(), None));
     }
 }
 
 impl Window {
     /// Create a Verso window from Winit window and return the rendering context.
     pub fn new(event_loop: &ActiveEventLoop, window_attributes: WindowAttributes) -> Self {
-        // let template = ConfigTemplateBuilder::new()
-        //     .with_alpha_size(8)
-        //     .with_transparency(cfg!(macos));
-
-        // let (window, gl_config) = DisplayBuilder::new()
-        //     .with_window_attributes(Some(window_attributes))
-        //     .build(evl, template, gl_config_picker)
-        //     .expect("Failed to create window and gl config");
-
         let display_handle = event_loop
             .display_handle()
             .expect("Failed to get display handle");
@@ -208,10 +377,6 @@ impl Window {
 
         let _ = rendering_context.make_current();
 
-        // let window = window.ok_or("Failed to create window").unwrap();
-
-        // log::debug!("Picked a config with {} samples", gl_config.num_samples());
-
         #[cfg(macos)]
         unsafe {
             let rwh = window.window_handle().expect("Failed to get window handle");
@@ -222,17 +387,22 @@ impl Window {
                 );
             }
         }
-        // let (rendering_context, surface) =
-        //     RenderingContext::create(&window, &gl_config, window.inner_size())
-        //         .expect("Failed to create rendering context");
         log::trace!("Created rendering context for window {:?}", window);
 
         Self {
             window,
             cursor_state: CursorState::default(),
-            // surface,
             rendering_context,
+            panel_context: None,
+            content_context: None,
+            panel_dirty: Cell::new(true),
+            content_dirty: Cell::new(true),
+            prompt_dirty: Cell::new(true),
             panel: None,
+            prompt: None,
+            panel_tab_ids: HashMap::new(),
+            next_panel_tab_index: 0,
+            ime_control: None,
             event_listeners: Default::default(),
             mouse_position: Default::default(),
             hovering_webview: None,
@@ -242,57 +412,9 @@ impl Window {
             menu_event_receiver: MenuEvent::receiver().clone(),
             tab_manager: TabManager::new(),
             focused_webview_id: None,
-            // webview_menu: None,
             show_bookmark: false,
         }
     }
-
-    // /// Create a Verso window with the rendering context.
-    // pub fn new_with_compositor(
-    //     evl: &ActiveEventLoop,
-    //     window_attributes: WindowAttributes,
-    //     compositor: &mut IOCompositor,
-    // ) -> Self {
-    //     let window = evl
-    //         .create_window(window_attributes)
-    //         .expect("Failed to create window.");
-
-    //     #[cfg(macos)]
-    //     unsafe {
-    //         let rwh = window.window_handle().expect("Failed to get window handle");
-    //         if let RawWindowHandle::AppKit(AppKitWindowHandle { ns_view, .. }) = rwh.as_ref() {
-    //             decorate_window(
-    //                 ns_view.as_ptr() as *mut AnyObject,
-    //                 LogicalPosition::new(8.0, 40.0),
-    //             );
-    //         }
-    //     }
-    //     let surface = compositor
-    //         .rendering_context
-    //         .create_surface(&window)
-    //         .unwrap();
-
-    //     let mut window = Self {
-    //         window,
-    //         cursor_state: CursorState::default(),
-    //         surface,
-    //         panel: None,
-    //         // webview: None,
-    //         event_listeners: Default::default(),
-    //         mouse_position: Default::default(),
-    //         hovering_webview: None,
-    //         modifiers_state: Cell::new(ModifiersState::default()),
-    //         resizing: false,
-    //         #[cfg(any(target_os = "macos", target_os = "windows"))]
-    //         menu_event_receiver: MenuEvent::receiver().clone(),
-    //         tab_manager: TabManager::new(),
-    //         focused_webview_id: None,
-    //         webview_menu: None,
-    //         show_bookmark: false,
-    //     };
-    //     compositor.swap_current_window(&mut window);
-    //     window
-    // }
 
     /// Get the content area size for the webview to draw on
     pub fn get_content_size(
@@ -310,138 +432,157 @@ impl Window {
                 height += BOOKMARK_HEIGHT;
             }
             height *= self.scale_factor();
-            // size.min.y = size.max.y.min(height as f32);
-            // size.min.x += 10.0;
-            // size.max.y -= 10.0;
-            // size.max.x -= 10.0;
             size.height -= height as u32
         }
         size
     }
 
-    /// Send the constellation message to start Panel UI
+    /// Create the panel webview and load the panel UI.
     pub fn create_panel(&mut self, verso: &Rc<Verso>, initial_url: url::Url) {
-        let hidpi_scale_factor = Scale::new(self.scale_factor() as f32);
-        let size = self.size();
-        // let size = size.to_f32() / hidpi_scale_factor;
-
-        let delegate = PanelWebViewDelegate(WindowWebViewDelegate {
-            verso: verso.clone(),
-            window_id: self.id(),
-        });
-        let webview = WebViewBuilder::new(&verso.servo)
+        let size = self.panel_size();
+        let context = Rc::new(self.rendering_context.offscreen_context(size));
+        let delegate = PanelWebViewDelegate(WindowWebViewDelegate::new(verso, self.id()));
+        // User scripts from the controller are meant for web content, not for the panel UI.
+        let webview = WebViewBuilder::new(&verso.servo, context.clone())
             .url(url::Url::parse("verso://resources/components/panel.html").unwrap())
-            .hidpi_scale_factor(hidpi_scale_factor)
-            .size(size)
+            .hidpi_scale_factor(self.hidpi_scale())
             .delegate(Rc::new(delegate))
             .build();
+        webview.resize(size);
+        webview.notify_theme_change(self.servo_theme());
+        self.panel_context = Some(context);
         self.panel = Some(Panel {
             webview,
             initial_url,
         });
     }
 
-    /// Create a new webview and send the constellation message to load the initial URL
+    /// Create a new tab webview and load the initial URL.
     pub fn create_tab(&mut self, verso: &Rc<Verso>, initial_url: url::Url) {
-        let size = self.size();
-        // let rect = DeviceRect::from_size(size);
-
-        let show_tab = self.tab_manager.count() >= 1;
-        let content_size = self.get_content_size(size, show_tab, self.show_bookmark);
-
-        let hidpi_scale_factor = Scale::new(self.scale_factor() as f32);
-        // let size = content_size.size().to_f32() / hidpi_scale_factor;
-
-        let delegate = WindowWebViewDelegate {
-            verso: verso.clone(),
-            window_id: self.id(),
-        };
-        let webview = WebViewBuilder::new(&verso.servo)
+        let size = self.content_size();
+        let context = self
+            .content_context
+            .get_or_insert_with(|| Rc::new(self.rendering_context.offscreen_context(size)))
+            .clone();
+        let delegate = WindowWebViewDelegate::new(verso, self.id());
+        let webview = WebViewBuilder::new(&verso.servo, context)
             .url(initial_url)
-            .hidpi_scale_factor(hidpi_scale_factor)
-            .size(content_size)
+            .hidpi_scale_factor(self.hidpi_scale())
+            .user_content_manager(verso.user_content_manager.clone())
             .delegate(Rc::new(delegate))
             .build();
+        webview.resize(size);
+        webview.notify_theme_change(self.servo_theme());
+        if let Some(zoom) = verso.config.zoom_level {
+            webview.set_page_zoom(zoom);
+        }
 
+        let id = webview.id();
+        let panel_tab_id = PanelTabId {
+            namespace_id: 0,
+            index: self.next_panel_tab_index,
+        };
+        self.next_panel_tab_index += 1;
+        self.panel_tab_ids.insert(id, panel_tab_id);
         if let Some(panel) = &self.panel {
             let cmd: String = format!(
                 "window.navbar.addTab('{}', {})",
-                serde_json::to_string(&webview.id()).unwrap(),
+                panel_tab_id.to_json(),
                 true,
             );
             panel.webview.evaluate_javascript(cmd, |_| {});
         }
 
-        log::debug!("Verso Window {:?} adds webview {}", self.id(), webview.id());
+        log::debug!("Verso Window {:?} adds webview {}", self.id(), id);
+        if let Some(previous) = self.tab_manager.current_tab_id() {
+            if let Some(tab) = self.tab_manager.tab(previous) {
+                tab.webview().hide();
+            }
+        }
         self.tab_manager.append_tab(webview, true);
+        if let Some(tab) = self.tab_manager.tab(id) {
+            tab.webview().show();
+            tab.webview().set_focused(true);
+        }
+        self.focused_webview_id = Some(id);
+        self.resize_webviews();
+        self.mark_region_dirty(Region::Content);
     }
 
     /// Close a tab
     pub fn close_tab(&mut self, tab_id: WebViewId) {
-        // if there are more than 2 tabs, we need to ask for the new active tab after tab is closed
-        if self.tab_manager.count() > 1 {
-            if let Some(panel) = &self.panel {
-                let cmd: String = format!(
-                    "const nextTab = window.navbar.closeTab('{}');",
-                    serde_json::to_string(&tab_id).unwrap()
-                );
-                let activate_next_tab = r#"if (nextTab) window.prompt(`ACTIVATE_TAB:${JSON.stringify({ id: nextTab })}`)"#;
-
-                panel
-                    .webview
-                    .evaluate_javascript(format!("{cmd}{activate_next_tab}"), |_| {});
-            }
+        if self.prompt.as_ref().is_some_and(|prompt| prompt.parent == tab_id) {
+            self.close_prompt();
         }
-        self.tab_manager.close_tab(tab_id);
+        let panel_tab_id = self.panel_tab_ids.remove(&tab_id);
+        // if there are more than 2 tabs, we need to ask for the new active tab after tab is closed
+        if self.tab_manager.count() > 1
+            && let Some(panel) = &self.panel
+            && let Some(panel_tab_id) = panel_tab_id
+        {
+            let cmd: String = format!(
+                "const nextTab = window.navbar.closeTab('{}');",
+                panel_tab_id.to_json()
+            );
+            let activate_next_tab = r#"if (nextTab) window.prompt(`ACTIVATE_TAB:${JSON.stringify({ id: nextTab })}`)"#;
+
+            panel
+                .webview
+                .evaluate_javascript(format!("{cmd}{activate_next_tab}"), |_| {});
+        }
+        let _ = self.tab_manager.close_tab(tab_id);
+        if let Some(next) = self.tab_manager.current_tab_id()
+            && let Some(tab) = self.tab_manager.tab(next)
+        {
+            tab.webview().show();
+            tab.webview().set_focused(true);
+            self.focused_webview_id = Some(next);
+        }
+        self.resize_webviews();
+        self.mark_region_dirty(Region::Content);
     }
 
     /// Activate a tab
-    pub fn activate_tab(&mut self, tab_id: WebViewId, show_tab: bool) {
-        // let size = self.size().to_f32();
-        // let rect = DeviceRect::from_size(size);
-        // let content_size = self.get_content_size(rect, show_tab, self.show_bookmark);
-        // let (tab_id, prompt_id) = self.tab_manager.set_size(tab_id, content_size);
+    pub fn activate_tab(&mut self, tab_id: WebViewId, _show_tab: bool) {
+        let Some(old_id) = self.tab_manager.current_tab_id() else {
+            return;
+        };
+        if self.tab_manager.activate_tab(tab_id).is_none() {
+            return;
+        }
+        if old_id != tab_id
+            && let Some(old) = self.tab_manager.tab(old_id)
+        {
+            old.webview().hide();
+        }
+        if let Some(tab) = self.tab_manager.tab(tab_id) {
+            tab.webview().show();
+            tab.webview().set_focused(true);
+        }
+        self.focused_webview_id = Some(tab_id);
+        self.resize_webviews();
+        self.update_navbar(tab_id);
+        if let Some(panel) = &self.panel
+            && let Some(panel_tab_id) = self.panel_tab_ids.get(&tab_id)
+        {
+            let cmd = format!("window.navbar.activateTab('{}')", panel_tab_id.to_json());
+            panel.webview.evaluate_javascript(cmd, |_| {});
+        }
+        self.mark_region_dirty(Region::Content);
+    }
 
-        // if let Some(prompt_id) = prompt_id {
-        //     compositor.on_resize_webview_event(prompt_id, content_size);
-        // }
-        // if let Some(tab_id) = tab_id {
-        //     compositor.on_resize_webview_event(tab_id, content_size);
-
-        //     let old_tab_id = self.tab_manager.current_tab_id();
-        //     if self.tab_manager.activate_tab(tab_id).is_some() {
-        //         // throttle the old tab to avoid unnecessary animation caclulations
-        //         if let Some(old_tab_id) = old_tab_id {
-        //             let _ = compositor.constellation_sender.send(
-        //                 EmbedderToConstellationMessage::SetWebViewThrottled(old_tab_id, true),
-        //             );
-        //         }
-        //         let _ = compositor.constellation_sender.send(
-        //             EmbedderToConstellationMessage::SetWebViewThrottled(tab_id, false),
-        //         );
-
-        //         self.focused_webview_id = Some(tab_id);
-        //         let _ = compositor
-        //             .constellation_sender
-        //             .send(EmbedderToConstellationMessage::FocusWebView(tab_id));
-
-        //         // Set navigation button enabled state
-        //         let history = self.tab_manager.history(tab_id).unwrap();
-        //         let prev_btn_enabled = history.current_idx > 0;
-        //         let next_btn_enabled = history.current_idx < history.list.len() - 1;
-        //         javascript_evaluator.evaluate_ignore_result(
-        //             &compositor.constellation_sender,
-        //             &self.panel.as_ref().unwrap().webview.webview_id,
-        //             format!(
-        //                 "window.navbar.setNavBtnEnabled({}, {})",
-        //                 prev_btn_enabled, next_btn_enabled
-        //             ),
-        //         );
-
-        //         // update painting order immediately to draw the active tab
-        //         compositor.send_root_pipeline_display_list(self);
-        //     }
-        // }
+    /// Drop every webview of this window. Servo can only shut down once all of them are gone.
+    pub(crate) fn close_webviews(&mut self) {
+        self.prompt = None;
+        self.panel = None;
+        for id in self.tab_manager.tab_ids() {
+            let _ = self.tab_manager.close_tab(id);
+        }
+        self.panel_tab_ids.clear();
+        self.focused_webview_id = None;
+        self.hovering_webview = None;
+        self.panel_context = None;
+        self.content_context = None;
     }
 
     /// Handle Winit window event and return a boolean to indicate if the compositor should repaint immediately.
@@ -450,68 +591,56 @@ impl Window {
         verso: &Rc<Verso>,
         event: &winit::event::WindowEvent,
     ) {
-        let Some(tab) = self.tab_manager.current_tab() else {
-            return;
-        };
-        let webview = tab.webview();
-
         match event {
             WindowEvent::RedrawRequested => {
-                self.window.pre_present_notify();
-                self.rendering_context.present();
-                // if let Err(err) = compositor.rendering_context.present(&self.surface) {
-                //     log::warn!("Failed to present surface: {:?}", err);
-                // }
-            }
-            // WindowEvent::Focused(focused) => {
-            //     if *focused {
-            //         compositor.swap_current_window(self);
-            //     }
-            // }
+                self.repaint();
+            },
             WindowEvent::Resized(size) => {
                 if self.window.has_focus() {
                     self.resizing = true;
                 }
-                // let size = Size2D::new(size.width, size.height);
-                // compositor.resize(size.to_f32(), self);
-            }
+                let size = PhysicalSize::new(size.width.max(1), size.height.max(1));
+                self.rendering_context.resize(size);
+                self.resize_webviews();
+                self.window.request_redraw();
+            },
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                // compositor.on_scale_factor_event(*scale_factor as f32, self);
-            }
-            WindowEvent::CursorEntered { .. } => {
-                // compositor.swap_current_window(self);
-            }
+                let scale = self.scale_for(*scale_factor);
+                for webview in self.all_webviews() {
+                    webview.set_hidpi_scale_factor(scale);
+                }
+                self.resize_webviews();
+            },
             WindowEvent::CursorLeft { .. } => {
-                // let hovering_webview = self.hovering_webview.take();
-                // if let Some(hovering_webview) = hovering_webview {
-                //     forward_input_event(
-                //         compositor,
-                //         hovering_webview,
-                //         sender,
-                //         InputEvent::MouseLeftViewport(MouseLeftViewportEvent::default()),
-                //     );
-                // }
-            }
+                if let Some(id) = self.hovering_webview.take()
+                    && let Some(webview) = self.webview_cloned(id)
+                {
+                    webview.notify_input_event(InputEvent::MouseLeftViewport(
+                        MouseLeftViewportEvent::default(),
+                    ));
+                }
+            },
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_position.set(Some(*position));
-
                 let point = DevicePoint::new(position.x as f32, position.y as f32);
-                let target_webview = self.forward_mouse_move(point);
+                let target = self.hit_test(point);
+                let target_id = target.as_ref().map(|(webview, _)| webview.id());
                 let last_hovering_webview = self.hovering_webview.take();
-                self.hovering_webview = target_webview;
-
-                if last_hovering_webview != target_webview {
-                    if let Some(last_hovering_webview) = last_hovering_webview {
-                        // forward_input_event(
-                        //     compositor,
-                        //     last_hovering_webview,
-                        //     sender,
-                        //     InputEvent::MouseLeftViewport(MouseLeftViewportEvent::default()),
-                        // );
-                    }
+                self.hovering_webview = target_id;
+                if last_hovering_webview != target_id
+                    && let Some(last_id) = last_hovering_webview
+                    && let Some(webview) = self.webview_cloned(last_id)
+                {
+                    webview.notify_input_event(InputEvent::MouseLeftViewport(
+                        MouseLeftViewportEvent::default(),
+                    ));
+                }
+                if let Some((webview, local)) = target {
+                    webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
+                        local.into(),
+                    )));
                 }
 
-                // handle Windows and Linux non-decoration window resize cursor
                 #[cfg(any(linux, target_os = "windows"))]
                 {
                     if self.should_use_client_region_drag() {
@@ -519,25 +648,14 @@ impl Window {
                         self.set_drag_resize_cursor(direction);
                     }
                 }
-            }
+            },
             WindowEvent::MouseInput { state, button, .. } => {
-                let point = match self.mouse_position.get() {
-                    Some(point) => DevicePoint::new(point.x as f32, point.y as f32),
-                    None => {
-                        log::trace!("Mouse position is None, skipping MouseInput event.");
-                        return;
-                    }
+                let Some(position) = self.mouse_position.get() else {
+                    log::trace!("Mouse position is None, skipping MouseInput event.");
+                    return;
                 };
+                let point = DevicePoint::new(position.x as f32, position.y as f32);
 
-                // /* handle context menu */
-                // if let (ElementState::Pressed, winit::event::MouseButton::Right) = (state, button) {
-                //     let prompt = self.tab_manager.current_prompt();
-                //     if prompt.is_some() {
-                //         return;
-                //     }
-                // }
-
-                /* handle Windows and Linux non-decoration window resize */
                 #[cfg(any(linux, target_os = "windows"))]
                 {
                     if *state == ElementState::Pressed
@@ -548,229 +666,106 @@ impl Window {
                     }
                 }
 
-                /* handle mouse events */
-
-                let button: MouseButton = match button {
-                    winit::event::MouseButton::Left => MouseButton::Left,
-                    winit::event::MouseButton::Right => MouseButton::Right,
-                    winit::event::MouseButton::Middle => MouseButton::Middle,
+                let button = match button {
+                    winit::event::MouseButton::Left => MouseButton::Primary,
+                    winit::event::MouseButton::Right => MouseButton::Secondary,
+                    winit::event::MouseButton::Middle => MouseButton::Auxiliary,
                     winit::event::MouseButton::Back => MouseButton::Back,
                     winit::event::MouseButton::Forward => MouseButton::Forward,
                     winit::event::MouseButton::Other(value) => MouseButton::Other(*value),
                 };
-
                 let action = match state {
                     ElementState::Pressed => MouseButtonAction::Down,
                     ElementState::Released => MouseButtonAction::Up,
                 };
-
+                let Some((webview, local)) = self.hit_test(point) else {
+                    return;
+                };
+                if *state == ElementState::Pressed {
+                    self.focus_webview(webview.id());
+                }
                 webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                     action,
                     button,
-                    point.into(),
+                    local.into(),
                 )));
-            }
+            },
             WindowEvent::PinchGesture { delta, .. } => {
                 let center = self.mouse_position.get().unwrap_or_default();
-                webview.pinch_zoom(
-                    *delta as f32 + 1.0,
-                    Point2D::new(center.x as f32, center.y as f32),
-                );
-            }
-            WindowEvent::MouseWheel { delta, phase, .. } => {
-                let point = match self.mouse_position.get() {
-                    Some(point) => point,
-                    None => {
-                        log::trace!("Mouse position is None, skipping MouseWheel event.");
-                        return;
-                    }
+                let point = DevicePoint::new(center.x as f32, center.y as f32);
+                if let Some((webview, local)) = self.hit_test(point) {
+                    webview.adjust_pinch_zoom(*delta as f32, local);
+                }
+            },
+            WindowEvent::MouseWheel { delta, .. } => {
+                let Some(position) = self.mouse_position.get() else {
+                    log::trace!("Mouse position is None, skipping MouseWheel event.");
+                    return;
                 };
-
-                // FIXME: Pixels per line, should be configurable (from browser setting?) and vary by zoom level.
                 const LINE_HEIGHT: f32 = 38.0;
-
-                let (mut dx, mut dy, _mode) = match delta {
+                let (mut dx, mut dy) = match delta {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                        (*x as f64, (*y * LINE_HEIGHT) as f64, WheelMode::DeltaLine)
-                    }
+                        (*x as f64, (*y * LINE_HEIGHT) as f64)
+                    },
                     winit::event::MouseScrollDelta::PixelDelta(position) => {
                         let position = position.to_logical::<f64>(self.window.scale_factor());
-                        (position.x, position.y, WheelMode::DeltaPixel)
-                    }
+                        (position.x, position.y)
+                    },
                 };
-
-                // Scroll Event
-                // Do one axis at a time.
                 if dy.abs() >= dx.abs() {
                     dx = 0.0;
                 } else {
                     dy = 0.0;
                 }
-
-                // let phase: TouchEventType = match phase {
-                //     TouchPhase::Started => TouchEventType::Down,
-                //     TouchPhase::Moved => TouchEventType::Move,
-                //     TouchPhase::Ended => TouchEventType::Up,
-                //     TouchPhase::Cancelled => TouchEventType::Cancel,
-                // };
-                let scroll = Scroll::Delta(DeviceVector2D::new(dx as f32, dy as f32).into());
-                let point = DevicePoint::new(point.x as f32, point.y as f32).into();
-                webview.notify_scroll_event(scroll, point);
-            }
-            // Crashes at the moment, need to fully migrate the touch if we want this
-            // WindowEvent::Touch(touch) => {
-            //     let webview_id = match self.focused_webview_id {
-            //         Some(webview_id) => webview_id,
-            //         None => {
-            //             log::trace!("No focused webview, skipping touch event.");
-            //             return;
-            //         }
-            //     };
-            //     let action = match touch.phase {
-            //         TouchPhase::Started => TouchEventType::Down,
-            //         TouchPhase::Moved => TouchEventType::Move,
-            //         TouchPhase::Ended => TouchEventType::Up,
-            //         TouchPhase::Cancelled => TouchEventType::Cancel,
-            //     };
-            //     forward_input_event(
-            //         compositor,
-            //         webview_id,
-            //         sender,
-            //         InputEvent::Touch(TouchEvent::new(
-            //             action,
-            //             TouchId(touch.id as _),
-            //             DevicePoint::new(touch.location.x as f32, touch.location.y as f32),
-            //         )),
-            //     );
-            // }
+                let point = DevicePoint::new(position.x as f32, position.y as f32);
+                if let Some((webview, local)) = self.hit_test(point) {
+                    let scroll = Scroll::Delta(DeviceVector2D::new(dx as f32, dy as f32).into());
+                    webview.notify_scroll_event(scroll, local.into());
+                }
+            },
             WindowEvent::ModifiersChanged(modifier) => self.modifiers_state.set(modifier.state()),
-            WindowEvent::Ime(event) => {
-                // let webview_id = match self.focused_webview_id {
-                //     Some(webview_id) => webview_id,
-                //     None => {
-                //         log::trace!("No focused webview, skipping Ime event.");
-                //         return;
-                //     }
-                // };
-                // if !self.has_webview(webview_id) {
-                //     log::trace!(
-                //         "Webview {:?} doesn't exist, skipping Ime event.",
-                //         webview_id
-                //     );
-                //     return;
-                // }
-
-                // match event {
-                //     Ime::Commit(text) => {
-                //         let text = text.clone();
-                //         forward_input_event(
-                //             compositor,
-                //             webview_id,
-                //             sender,
-                //             InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
-                //                 state: CompositionState::End,
-                //                 data: text,
-                //             })),
-                //         );
-                //     }
-                //     Ime::Enabled => {
-                //         forward_input_event(
-                //             compositor,
-                //             webview_id,
-                //             sender,
-                //             InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
-                //                 state: CompositionState::Start,
-                //                 data: String::new(),
-                //             })),
-                //         );
-                //     }
-                //     Ime::Preedit(text, _) => {
-                //         forward_input_event(
-                //             compositor,
-                //             webview_id,
-                //             sender,
-                //             InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
-                //                 state: CompositionState::Update,
-                //                 data: text.to_string(),
-                //             })),
-                //         );
-                //     }
-                //     Ime::Disabled => {
-                //         forward_input_event(
-                //             compositor,
-                //             webview_id,
-                //             sender,
-                //             InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
-                //                 state: CompositionState::End,
-                //                 data: String::new(),
-                //             })),
-                //         );
-                //     }
-                // }
-            }
             WindowEvent::KeyboardInput { event, .. } => {
-                let webview_id = match self.focused_webview_id {
-                    Some(webview_id) => webview_id,
-                    None => {
-                        log::trace!("No focused webview, skipping KeyboardInput event.");
-                        return;
-                    }
-                };
-                if !self.has_webview(webview_id) {
-                    log::trace!(
-                        "Webview {:?} doesn't exist, skipping KeyboardInput event.",
-                        webview_id
-                    );
-                    return;
-                }
                 let event = keyboard_event_from_winit(event, self.modifiers_state.get());
-                log::trace!("Verso is handling {:?}", event);
-
-                drop(webview);
-                /* Window operation keyboard shortcut */
-                if self.handle_keyboard_shortcut(verso, &event.event) {
+                log::trace!("Verso is handling {event:?}");
+                if self.prompt.is_none() && self.handle_keyboard_shortcut(verso, &event.event) {
                     return;
                 }
-                let webview = self.tab_manager.current_tab().unwrap().webview();
-                webview.notify_input_event(InputEvent::Keyboard(event));
-            }
+                if let Some(webview) = self.focused_or_current() {
+                    webview.notify_input_event(InputEvent::Keyboard(event));
+                }
+            },
             WindowEvent::ThemeChanged(theme) => {
                 let theme = to_servo_theme(Some(theme));
-                for tab in self.tab_manager.tabs() {
-                    tab.webview().notify_theme_change(theme);
+                for webview in self.all_webviews() {
+                    webview.notify_theme_change(theme);
                 }
-                if let Some(panel) = &self.panel {
-                    panel.webview.notify_theme_change(theme);
-                }
-            }
-            e => log::trace!("Verso Window isn't supporting this window event yet: {e:?}"),
+            },
+            _ => log::trace!("Verso Window isn't supporting this window event yet: {event:?}"),
         }
     }
 
     /// Handle Window keyboard shortcut
     ///
-    /// - Returns `true` if the event is handled, then we should skip sending it to constellation
+    /// - Returns `true` if the event is handled, then we should skip sending it to the webview
     fn handle_keyboard_shortcut(&mut self, verso: &Rc<Verso>, event: &KeyboardEvent) -> bool {
-        let is_macos = cfg!(target_os = "macos");
-        let control_or_meta = if is_macos {
+        let control_or_meta = if cfg!(target_os = "macos") {
             Modifiers::META
         } else {
             Modifiers::CONTROL
         };
 
         if event.state == KeyState::Down {
-            // TODO: New Window, Close Browser
             match (event.modifiers, event.code) {
                 (modifiers, Code::KeyT) if modifiers == control_or_meta => {
-                    (*self).create_tab(verso, url::Url::parse("https://example.com").unwrap());
+                    self.create_tab(verso, url::Url::parse("https://example.com").unwrap());
                     return true;
-                }
+                },
                 (modifiers, Code::KeyW) if modifiers == control_or_meta => {
                     if let Some(tab_id) = self.tab_manager.current_tab_id() {
-                        (*self).close_tab(tab_id);
+                        self.close_tab(tab_id);
                     }
                     return true;
-                }
+                },
                 _ => (),
             }
         }
@@ -778,114 +773,543 @@ impl Window {
         false
     }
 
-    /// Handle servo messages. Return true if it requests a new window
-    pub fn handle_servo_message(
+    fn finish_panel_load(&mut self, verso: &Rc<Verso>) {
+        let initial_url = self.panel.as_ref().map(|panel| panel.initial_url.clone());
+        if self.tab_manager.count() == 0
+            && let Some(initial_url) = initial_url
+        {
+            self.create_tab(verso, initial_url);
+        }
+        self.mark_region_dirty(Region::Panel);
+    }
+
+    /// Height of the panel chrome, in device pixels.
+    fn chrome_height(&self) -> u32 {
+        if self.panel.is_none() {
+            return 0;
+        }
+        let mut height = PANEL_HEIGHT + PANEL_PADDING;
+        if self.tab_manager.count() > 1 {
+            height += TAB_HEIGHT;
+        }
+        if self.show_bookmark {
+            height += BOOKMARK_HEIGHT;
+        }
+        (height * self.scale_factor()) as u32
+    }
+
+    fn panel_size(&self) -> PhysicalSize<u32> {
+        PhysicalSize::new(self.size().width.max(1), self.chrome_height().max(1))
+    }
+
+    fn content_size(&self) -> PhysicalSize<u32> {
+        let size = self.size();
+        PhysicalSize::new(
+            size.width.max(1),
+            size.height.saturating_sub(self.chrome_height()).max(1),
+        )
+    }
+
+    fn prompt_size(&self) -> PhysicalSize<u32> {
+        let scale = self.scale_factor();
+        let content = self.content_size();
+        PhysicalSize::new(
+            ((PROMPT_LOGICAL_SIZE.0 * scale) as u32).clamp(1, content.width),
+            ((PROMPT_LOGICAL_SIZE.1 * scale) as u32).clamp(1, content.height),
+        )
+    }
+
+    /// Rectangle of a region in device pixels, with the origin at the top left of the window.
+    fn region_rect(&self, region: Region) -> euclid::default::Rect<i32> {
+        let window_w = self.size().width.max(1) as i32;
+        let window_h = self.size().height.max(1) as i32;
+        let chrome = self.chrome_height() as i32;
+        let (origin, size) = match region {
+            Region::Panel => ((0, 0), (window_w, chrome.max(1))),
+            Region::Content => ((0, chrome), (window_w, (window_h - chrome).max(1))),
+            Region::Prompt => {
+                let content = self.content_size();
+                let prompt = self.prompt_size();
+                (
+                    (
+                        (content.width as i32 - prompt.width as i32) / 2,
+                        chrome + (content.height as i32 - prompt.height as i32) / 2,
+                    ),
+                    (prompt.width as i32, prompt.height as i32),
+                )
+            },
+        };
+        euclid::default::Rect::new(origin.into(), size.into())
+    }
+
+    /// Rectangle of a region in GL coordinates, with the origin at the bottom left.
+    fn gl_target_rect(&self, region: Region) -> euclid::default::Rect<i32> {
+        let window_h = self.size().height.max(1) as i32;
+        let rect = self.region_rect(region);
+        euclid::default::Rect::new(
+            euclid::default::Point2D::new(rect.origin.x, window_h - rect.origin.y - rect.height()),
+            rect.size,
+        )
+    }
+
+    fn hidpi_scale(&self) -> Scale<f32, DeviceIndependentPixel, DevicePixel> {
+        Scale::new(self.scale_factor() as f32)
+    }
+
+    fn scale_for(&self, scale_factor: f64) -> Scale<f32, DeviceIndependentPixel, DevicePixel> {
+        Scale::new(scale_factor as f32)
+    }
+
+    fn servo_theme(&self) -> servo::Theme {
+        to_servo_theme(self.window.theme().as_ref())
+    }
+
+    /// Record that Servo has a new frame for `webview_id` and ask winit for a redraw.
+    pub(crate) fn mark_dirty(&self, webview_id: WebViewId) {
+        self.mark_region_dirty(self.region_of(webview_id));
+    }
+
+    /// The region a webview is drawn in.
+    fn region_of(&self, webview_id: WebViewId) -> Region {
+        if self
+            .panel
+            .as_ref()
+            .is_some_and(|panel| panel.webview.id() == webview_id)
+        {
+            Region::Panel
+        } else if self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.webview.id() == webview_id)
+        {
+            Region::Prompt
+        } else {
+            Region::Content
+        }
+    }
+
+    /// Top-left corner of a webview's region, in device pixels from the top left of the window.
+    pub(crate) fn webview_origin(&self, webview_id: WebViewId) -> euclid::default::Point2D<i32> {
+        self.region_rect(self.region_of(webview_id)).origin
+    }
+
+    fn mark_region_dirty(&self, region: Region) {
+        match region {
+            Region::Panel => self.panel_dirty.set(true),
+            Region::Content => self.content_dirty.set(true),
+            Region::Prompt => self.prompt_dirty.set(true),
+        }
+        self.window.request_redraw();
+    }
+
+    /// Paint the regions that have a new frame, blit every region into the window, and present
+    /// once. Called on `WindowEvent::RedrawRequested`.
+    pub(crate) fn repaint(&self) {
+        let _ = self.rendering_context.make_current();
+        if let Some(panel) = &self.panel {
+            self.blit_region(Region::Panel, &panel.webview, &self.panel_context);
+        }
+        if let Some(tab) = self.tab_manager.current_tab() {
+            self.blit_region(Region::Content, tab.webview(), &self.content_context);
+        }
+        if let Some(prompt) = &self.prompt {
+            self.blit_region(
+                Region::Prompt,
+                &prompt.webview,
+                &Some(prompt.rendering_context.clone()),
+            );
+        }
+        self.window.pre_present_notify();
+        self.rendering_context.present();
+    }
+
+    fn blit_region(
+        &self,
+        region: Region,
+        webview: &WebView,
+        context: &Option<Rc<OffscreenRenderingContext>>,
+    ) {
+        let dirty = match region {
+            Region::Panel => &self.panel_dirty,
+            Region::Content => &self.content_dirty,
+            Region::Prompt => &self.prompt_dirty,
+        };
+        if dirty.take() {
+            webview.paint();
+        }
+        let Some(blit) = context
+            .as_ref()
+            .and_then(|context| context.render_to_parent_callback())
+        else {
+            return;
+        };
+        blit(
+            self.rendering_context.glow_gl_api().as_ref(),
+            self.gl_target_rect(region),
+        );
+    }
+
+    /// Size every webview to its region. Resizing one tab resizes the shared content context,
+    /// and with it every other tab.
+    fn resize_webviews(&mut self) {
+        if let Some(panel) = &self.panel {
+            panel.webview.resize(self.panel_size());
+        }
+        if let Some(tab) = self.tab_manager.current_tab() {
+            tab.webview().resize(self.content_size());
+        }
+        if let Some(prompt) = &self.prompt {
+            prompt.webview.resize(self.prompt_size());
+        }
+    }
+
+    /// Find the webview under `point` and translate the point into that webview.
+    fn hit_test(&self, point: DevicePoint) -> Option<(WebView, DevicePoint)> {
+        // A prompt is modal: only the prompt itself receives input.
+        if let Some(prompt) = &self.prompt {
+            let rect = self.region_rect(Region::Prompt).to_f32();
+            if !rect.contains(euclid::default::Point2D::new(point.x, point.y)) {
+                return None;
+            }
+            return Some((
+                prompt.webview.clone(),
+                DevicePoint::new(point.x - rect.origin.x, point.y - rect.origin.y),
+            ));
+        }
+        let chrome = self.chrome_height() as f32;
+        if self.panel.is_some() && point.y < chrome {
+            let panel = self.panel.as_ref()?;
+            return Some((panel.webview.clone(), point));
+        }
+        let tab = self.tab_manager.current_tab()?;
+        Some((
+            tab.webview().clone(),
+            DevicePoint::new(point.x, (point.y - chrome).max(0.0)),
+        ))
+    }
+
+    fn all_webviews(&self) -> Vec<WebView> {
+        self.panel
+            .iter()
+            .map(|panel| panel.webview.clone())
+            .chain(self.tab_manager.tabs().map(|tab| tab.webview().clone()))
+            .chain(self.prompt.iter().map(|prompt| prompt.webview.clone()))
+            .collect()
+    }
+
+    fn webview_cloned(&self, id: WebViewId) -> Option<WebView> {
+        if let Some(panel) = &self.panel
+            && panel.webview.id() == id
+        {
+            return Some(panel.webview.clone());
+        }
+        if let Some(prompt) = &self.prompt
+            && prompt.webview.id() == id
+        {
+            return Some(prompt.webview.clone());
+        }
+        self.tab_manager.tab(id).map(|tab| tab.webview().clone())
+    }
+
+    fn focused_or_current(&self) -> Option<WebView> {
+        self.focused_webview_id
+            .and_then(|id| self.webview_cloned(id))
+            .or_else(|| self.tab_manager.current_tab().map(|tab| tab.webview().clone()))
+            .or_else(|| self.panel.as_ref().map(|panel| panel.webview.clone()))
+    }
+
+    fn focus_webview(&mut self, id: WebViewId) {
+        if self.focused_webview_id == Some(id) {
+            return;
+        }
+        if let Some(old) = self.focused_webview_id.and_then(|old| self.webview_cloned(old)) {
+            old.set_focused(false);
+        }
+        if let Some(webview) = self.webview_cloned(id) {
+            webview.set_focused(true);
+            self.focused_webview_id = Some(id);
+        }
+    }
+
+    /// Update the navbar buttons and URL from the active tab's `WebView` state.
+    fn update_navbar(&self, tab_id: WebViewId) {
+        if self.tab_manager.current_tab_id() != Some(tab_id) {
+            return;
+        }
+        let (Some(panel), Some(tab)) = (&self.panel, self.tab_manager.tab(tab_id)) else {
+            return;
+        };
+        let webview = tab.webview();
+        panel.webview.evaluate_javascript(
+            format!(
+                "window.navbar.setNavBtnEnabled({}, {})",
+                webview.can_go_back(),
+                webview.can_go_forward()
+            ),
+            |_| {},
+        );
+        if let Some(url) = webview.url() {
+            let url = serde_json::to_string(url.as_str()).unwrap_or_default();
+            panel
+                .webview
+                .evaluate_javascript(format!("window.navbar.setNavbarUrl({url})"), |_| {});
+        }
+    }
+
+    fn set_tab_title(&mut self, tab_id: WebViewId, title: Option<String>) {
+        let title = title.unwrap_or_else(|| "null".to_string());
+        self.tab_manager.set_title(tab_id, title.clone());
+        let (Some(panel), Some(panel_tab_id)) = (&self.panel, self.panel_tab_ids.get(&tab_id))
+        else {
+            return;
+        };
+        let script = format!(
+            "window.navbar.setTabTitle('{}', {})",
+            panel_tab_id.to_json(),
+            serde_json::to_string(&title).unwrap_or_else(|_| "null".to_string())
+        );
+        panel.webview.evaluate_javascript(script, |_| {});
+    }
+
+    /// Send a navigation to the controller when it listens for them. Returns the request back
+    /// when it should be allowed right away.
+    fn defer_navigation_to_controller(
         &mut self,
+        verso: &Rc<Verso>,
+        request: NavigationRequest,
+    ) -> Option<NavigationRequest> {
+        if !self.event_listeners.on_navigation_starting {
+            return Some(request);
+        }
+        let Some(sender) = verso.controller_sender() else {
+            return Some(request);
+        };
+        let id = uuid::Uuid::new_v4();
+        if let Err(error) = sender.send(ToControllerMessage::OnNavigationStarting(
+            id.as_bytes().to_vec(),
+            request.url.clone(),
+        )) {
+            log::error!("Verso failed to send OnNavigationStarting to controller: {error}");
+            return Some(request);
+        }
+        self.event_listeners
+            .pending_navigations
+            .insert(id, request);
+        None
+    }
+
+    /// Answer a navigation request that was sent to the controller.
+    pub(crate) fn answer_navigation(&mut self, id: &[u8], allow: bool) {
+        let Ok(id) = uuid::Uuid::from_slice(id) else {
+            log::error!("Controller answered an unknown navigation id");
+            return;
+        };
+        match self.event_listeners.pending_navigations.remove(&id) {
+            Some(request) if allow => request.allow(),
+            Some(request) => request.deny(),
+            None => log::warn!("No pending navigation for controller response {id}"),
+        }
+    }
+
+    fn present_panel_control(
+        &mut self,
+        verso: &Rc<Verso>,
+        panel_id: WebViewId,
+        control: EmbedderControl,
+    ) {
+        match control {
+            EmbedderControl::SimpleDialog(SimpleDialog::Prompt(dialog)) => {
+                let message = dialog.message().to_owned();
+                self.handle_panel_prompt(verso, &message);
+                dialog.confirm();
+            },
+            EmbedderControl::SimpleDialog(dialog) => dialog.confirm(),
+            other => self.present_embedder_control(verso, panel_id, other),
+        }
+    }
+
+    fn present_embedder_control(
+        &mut self,
+        verso: &Rc<Verso>,
         webview_id: WebViewId,
-        message: EmbedderMsg,
-        sender: &Sender<EmbedderToConstellationMessage>,
-        to_controller_sender: &Option<IpcSender<ToControllerMessage>>,
-        clipboard: Option<&mut Clipboard>,
-        bookmark_manager: &mut BookmarkManager,
-    ) -> bool {
-        match message {
-            EmbedderMsg::SetCursor(_, cursor) => {
-                self.set_cursor_icon(cursor);
-                return false;
-            }
-            EmbedderMsg::GetWindowRect(_, response_sender) => {
-                let scale_factor = self.window.scale_factor() as f32;
-                let position = self.window.outer_position().unwrap_or_default();
-                let size = self.window.outer_size();
-                let window_rect = DeviceIntRect::from_origin_and_size(
-                    Point2D::new(position.x, position.y),
-                    Size2D::new(size.width, size.height).to_i32(),
-                );
-                if let Err(error) = response_sender.send(convert_rect_to_css_pixel(
-                    window_rect,
-                    Scale::new(scale_factor),
-                )) {
-                    log::error!("Failed to respond to GetWindowRect: {error}");
-                }
-                return false;
-            }
-            EmbedderMsg::GetScreenMetrics(_, response_sender) => {
-                let monitor = self.window.current_monitor();
-                let screen_size = monitor
-                    .as_ref()
-                    .map(|monitor| monitor.size().cast())
-                    .unwrap_or_default();
-                let scale_factor = monitor
-                    .as_ref()
-                    .map(|monitor| monitor.scale_factor() as f32)
-                    .unwrap_or_default();
-                // let toolbar_size = Size2D::new(
-                //     0.0,
-                //     (self.toolbar_height.get() * self.hidpi_scale_factor()).0,
-                // );
-                // let screen_size = self.screen_size.to_f32() * hidpi_factor;
-
-                // // FIXME: In reality, this should subtract screen space used by the system interface
-                // // elements, but it is difficult to get this value with `winit` currently. See:
-                // // See https://github.com/rust-windowing/winit/issues/2494
-                // let available_screen_size = screen_size - toolbar_size;
-
-                let screen_metrics = ScreenMetrics {
-                    screen_size: convert_size_to_css_pixel(
-                        Size2D::new(screen_size.width, screen_size.height),
-                        Scale::new(scale_factor),
-                    ),
-                    available_size: convert_size_to_css_pixel(
-                        Size2D::new(screen_size.width, screen_size.height),
-                        Scale::new(scale_factor),
-                    ),
+        control: EmbedderControl,
+    ) {
+        let control_id = control.id();
+        match control {
+            EmbedderControl::FilePicker(picker) => present_file_picker(picker),
+            EmbedderControl::ContextMenu(menu) => self.show_context_menu(menu),
+            EmbedderControl::SelectElement(select) => self.show_select_element(webview_id, select),
+            EmbedderControl::SimpleDialog(dialog) => {
+                let pending = match dialog {
+                    SimpleDialog::Alert(dialog) => PendingPrompt::Alert(dialog),
+                    SimpleDialog::Confirm(dialog) => PendingPrompt::Confirm(dialog),
+                    SimpleDialog::Prompt(dialog) => PendingPrompt::Input(dialog),
                 };
-                if let Err(error) = response_sender.send(screen_metrics) {
-                    log::error!("Failed to respond to GetScreenMetrics: {error}");
+                self.show_prompt(verso, webview_id, Some(control_id), pending);
+            },
+            EmbedderControl::InputMethod(input) => {
+                if input.allow_virtual_keyboard() {
+                    self.ime_control = Some(input.id());
+                    self.show_ime(webview_id, input.position());
                 }
-                return false;
-            }
-            _ => {}
+            },
+            EmbedderControl::ColorPicker(_) => {
+                // No native color picker is available. Dropping the control keeps the
+                // current color.
+                log::debug!("Color pickers are not supported yet");
+            },
+        }
+    }
+
+    fn hide_embedder_control(&mut self, control_id: EmbedderControlId) {
+        if self.ime_control == Some(control_id) {
+            self.ime_control = None;
+            self.hide_ime();
+        }
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.control_id == Some(control_id))
+        {
+            self.close_prompt();
+        }
+    }
+
+    /// Show a prompt page over the content area for a request from the tab `parent`.
+    fn show_prompt(
+        &mut self,
+        verso: &Rc<Verso>,
+        parent: WebViewId,
+        control_id: Option<EmbedderControlId>,
+        pending: PendingPrompt,
+    ) {
+        if self.tab_manager.tab(parent).is_none() {
+            log::debug!("Ignoring a prompt from a webview that is not a tab");
+            return;
+        }
+        if self.prompt.is_some() {
+            // Dropping the request gives Servo its default answer.
+            log::warn!("A prompt is already open; answering the new one with its default");
+            return;
+        }
+        if self.tab_manager.current_tab_id() != Some(parent) {
+            self.activate_tab(parent, true);
         }
 
-        // // Handle message in Verso Panel
-        // if let Some(panel) = &self.panel {
-        //     if panel.webview.webview_id == webview_id {
-        //         return self.handle_servo_messages_with_panel(
-        //             webview_id,
-        //             message,
-        //             sender,
-        //             clipboard,
-        //             compositor,
-        //             bookmark_manager,
-        //         );
-        //     }
-        // }
-        // if let Some(webview_menu) = &self.webview_menu {
-        //     if webview_menu.webview().webview_id == webview_id {
-        //         self.handle_servo_messages_with_webview_menu(
-        //             webview_id, message, sender, clipboard, compositor,
-        //         );
-        //         return false;
-        //     }
-        // }
-        // if self.tab_manager.has_prompt(webview_id) {
-        //     self.handle_servo_messages_with_prompt(
-        //         webview_id, message, sender, clipboard, compositor,
-        //     );
-        //     return false;
-        // }
+        let size = self.prompt_size();
+        let context = Rc::new(self.rendering_context.offscreen_context(size));
+        let delegate = PromptWebViewDelegate(WindowWebViewDelegate::new(verso, self.id()));
+        let webview = WebViewBuilder::new(&verso.servo, context.clone())
+            .url(pending.resource_url())
+            .hidpi_scale_factor(self.hidpi_scale())
+            .delegate(Rc::new(delegate))
+            .build();
+        webview.resize(size);
+        webview.notify_theme_change(self.servo_theme());
+        let id = webview.id();
+        log::debug!("Verso Window {:?} shows prompt {} for tab {}", self.id(), id, parent);
+        self.prompt = Some(Prompt {
+            webview,
+            rendering_context: context,
+            parent,
+            control_id,
+            pending: Some(pending),
+        });
+        self.focus_webview(id);
+        self.mark_region_dirty(Region::Prompt);
+    }
 
-        // Handle message in Verso WebView
-        // self.handle_servo_messages_with_webview(
-        //     webview_id,
-        //     message,
-        //     sender,
-        //     to_controller_sender,
-        //     clipboard,
-        //     compositor,
-        // );
-        false
+    /// Finish the prompt shown by `prompt_webview`, answering its request with `result`.
+    fn finish_prompt(&mut self, prompt_webview: WebViewId, result: Option<&str>) {
+        let Some(prompt) = self
+            .prompt
+            .as_mut()
+            .filter(|prompt| prompt.webview.id() == prompt_webview)
+        else {
+            return;
+        };
+        if let Some(result) = result {
+            prompt.respond(result);
+        }
+        self.close_prompt();
+    }
+
+    /// Remove the prompt overlay. An unanswered request gets Servo's default answer.
+    fn close_prompt(&mut self) {
+        let Some(prompt) = self.prompt.take() else {
+            return;
+        };
+        if self.focused_webview_id == Some(prompt.webview.id()) {
+            self.focused_webview_id = None;
+            self.focus_webview(prompt.parent);
+        }
+        self.mark_region_dirty(Region::Content);
+    }
+
+    fn handle_panel_prompt(&mut self, verso: &Rc<Verso>, message: &str) {
+        let current = self
+            .tab_manager
+            .current_tab()
+            .map(|tab| tab.webview().clone());
+        match message {
+            "PREV" => {
+                if let Some(webview) = current {
+                    let _ = webview.go_back(1);
+                }
+            },
+            "FORWARD" => {
+                if let Some(webview) = current {
+                    let _ = webview.go_forward(1);
+                }
+            },
+            "REFRESH" => {
+                if let Some(webview) = current {
+                    webview.reload();
+                }
+            },
+            "MINIMIZE" => {
+                let _ = self.window.set_minimized(true);
+            },
+            "MAXIMIZE" => self.window.set_maximized(!self.window.is_maximized()),
+            other if other.starts_with("NAVIGATE_TO:") => {
+                let url = other.trim_start_matches("NAVIGATE_TO:");
+                let Ok(url) = url::Url::parse(url) else {
+                    log::warn!("Panel navigation URL is invalid: {url}");
+                    return;
+                };
+                if let Some(webview) = current {
+                    webview.load(url);
+                } else {
+                    self.create_tab(verso, url);
+                }
+            },
+            other if other.starts_with("ACTIVATE_TAB:") => {
+                let payload = other.trim_start_matches("ACTIVATE_TAB:");
+                if let Some(tab_id) = self.parse_activate_tab(payload) {
+                    self.activate_tab(tab_id, self.tab_manager.count() > 1);
+                }
+            },
+            _ => log::debug!("Ignoring panel prompt: {message}"),
+        }
+    }
+
+    /// Read the tab id from an `ACTIVATE_TAB:{"id": ...}` panel message.
+    fn parse_activate_tab(&self, payload: &str) -> Option<WebViewId> {
+        let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+        let id = &value["id"];
+        let panel_tab_id: PanelTabId = serde_json::from_value(id.clone()).ok().or_else(|| {
+            id.as_str()
+                .and_then(|text| serde_json::from_str(text).ok())
+        })?;
+        self.panel_tab_ids
+            .iter()
+            .find(|(_, id)| **id == panel_tab_id)
+            .map(|(webview_id, _)| *webview_id)
+    }
+
+    /// True when a webview in this window is producing animation frames.
+    pub(crate) fn is_animating(&self) -> bool {
+        self.all_webviews().iter().any(|webview| webview.animating())
     }
 
     /// Queues a Winit `WindowEvent::RedrawRequested` event to be emitted that aligns with the windowing system drawing loop.
@@ -899,9 +1323,8 @@ impl Window {
     }
 
     /// Size of the window, including the window decorations.
-    pub fn outer_size(&self) -> DeviceSize {
-        let size = self.window.outer_size();
-        Size2D::new(size.width as f32, size.height as f32)
+    pub fn outer_size(&self) -> PhysicalSize<u32> {
+        self.window.outer_size()
     }
 
     /// Get Winit window ID of the window.
@@ -916,29 +1339,7 @@ impl Window {
 
     /// Check if the window has such webview.
     pub fn has_webview(&self, id: WebViewId) -> bool {
-        // if self
-        //     .webview_menu
-        //     .as_ref()
-        //     .is_some_and(|w| w.webview().webview_id == id)
-        // {
-        //     return true;
-        // }
-
-        // if self.tab_manager.has_prompt(id) {
-        //     return true;
-        // }
-
-        if let Some(panel) = &self.panel {
-            if panel.webview.id() == id {
-                return true;
-            }
-        }
-
-        if self.tab_manager.tab(id).is_some() {
-            return true;
-        }
-
-        false
+        self.webview_cloned(id).is_some()
     }
 
     /// Set cursor icon of the window.
@@ -990,25 +1391,12 @@ impl Window {
 
     /// This method enables IME and set the IME cursor area of the window.
     /// The position is in logical position so it'll scale according to screen scaling factor.
-    pub fn show_ime(
-        &self,
-        _input_method_typee: embedder_traits::InputMethodType,
-        _text: Option<(String, i32)>,
-        _multilinee: bool,
-        position: euclid::Box2D<i32, webrender_api::units::DevicePixel>,
-        show_bookmark: bool,
-    ) {
+    pub fn show_ime(&self, webview_id: WebViewId, position: DeviceIntRect) {
         self.window.set_ime_allowed(true);
-        let mut height: f64 = PANEL_HEIGHT + PANEL_PADDING;
-        if self.tab_manager.count() > 1 {
-            height += TAB_HEIGHT;
-        }
-        if show_bookmark {
-            height += BOOKMARK_HEIGHT;
-        }
+        let origin = self.webview_origin(webview_id);
         self.window.set_ime_cursor_area(
-            LogicalPosition::new(position.min.x, position.min.y + height as i32),
-            LogicalSize::new(0, position.max.y - position.min.y),
+            LogicalPosition::new(position.min.x + origin.x, position.min.y + origin.y),
+            LogicalSize::new(position.width(), position.height()),
         );
     }
 
@@ -1020,24 +1408,9 @@ impl Window {
     /// Show notification
     pub fn show_notification(&self, notification: &Notification) {
         let mut display_notification = notify_rust::Notification::new();
-
         display_notification
             .summary(&notification.title)
             .body(&notification.body);
-
-        #[cfg(linux)]
-        {
-            if let Some(icon_image) = notification.icon_resource.as_ref().and_then(|icon| {
-                Image::from_rgba(
-                    icon.metadata.width as i32,
-                    icon.metadata.height as i32,
-                    icon.bytes.to_vec(),
-                )
-                .ok()
-            }) {
-                display_notification.image_data(icon_image);
-            }
-        }
 
         #[cfg(linux)]
         std::thread::spawn(move || {
@@ -1057,57 +1430,6 @@ impl Window {
     //     }
     // }
 
-    /// Forward mouse move event to the first webview under the position,
-    /// returns the [`WebViewId`] of that webview
-    fn forward_mouse_move(&self, point: DevicePoint) -> Option<WebViewId> {
-        for webview in [
-            &self.tab_manager.current_tab().map(|tab| tab.webview()),
-            &self.panel.as_ref().map(|panel| &panel.webview),
-        ]
-        .into_iter()
-        .filter_map(|webview| *webview)
-        {
-            if !webview.rect().contains(point) {
-                continue;
-            }
-
-            webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point.into())));
-
-            return Some(webview.id());
-        }
-
-        None
-    }
-}
-
-// Prompt methods
-impl Window {
-    // /// Close window's prompt dialog
-    // pub(crate) fn close_prompt_dialog(&mut self, tab_id: WebViewId) {
-    //     if let Some(sender) = self
-    //         .tab_manager
-    //         .remove_prompt_by_tab_id(tab_id)
-    //         .and_then(|prompt| prompt.sender())
-    //     {
-    //         match sender {
-    //             PromptSender::AlertSender(sender) => {
-    //                 let _ = sender.send(AlertResponse::default());
-    //             }
-    //             PromptSender::ConfirmSender(sender) => {
-    //                 let _ = sender.send(ConfirmResponse::default());
-    //             }
-    //             PromptSender::InputSender(sender) => {
-    //                 let _ = sender.send(PromptResponse::default());
-    //             }
-    //             PromptSender::AllowDenySender(sender) => {
-    //                 let _ = sender.send(AllowOrDeny::Deny);
-    //             }
-    //             PromptSender::HttpBasicAuthSender(sender) => {
-    //                 let _ = sender.send(None);
-    //             }
-    //         }
-    //     }
-    // }
 }
 
 // Non-decorated window resizing for Windows and Linux.
@@ -1231,9 +1553,27 @@ pub unsafe fn decorate_window(view: *mut AnyObject, _position: LogicalPosition<f
     );
 }
 
-fn to_servo_theme(theme: Option<&winit::window::Theme>) -> embedder_traits::Theme {
+fn to_servo_theme(theme: Option<&winit::window::Theme>) -> servo::Theme {
     match theme {
-        Some(winit::window::Theme::Dark) => embedder_traits::Theme::Dark,
-        Some(winit::window::Theme::Light) | None => embedder_traits::Theme::Light,
+        Some(winit::window::Theme::Dark) => servo::Theme::Dark,
+        Some(winit::window::Theme::Light) | None => servo::Theme::Light,
+    }
+}
+
+fn present_file_picker(mut picker: FilePicker) {
+    let mut dialog = rfd::FileDialog::new();
+    for pattern in picker.filter_patterns() {
+        dialog = dialog.add_filter(&pattern.0, &[&pattern.0]);
+    }
+    let paths = if picker.allow_select_multiple() {
+        dialog.pick_files()
+    } else {
+        dialog.pick_file().map(|path| vec![path])
+    };
+    if let Some(paths) = paths {
+        picker.select(&paths);
+        picker.submit();
+    } else {
+        picker.dismiss();
     }
 }

@@ -1,18 +1,14 @@
 use std::collections::HashMap;
 
 // use crate::webview::prompt::PromptDialog;
-use base::id::WebViewId;
 use dpi::PhysicalSize;
 use serde::{Deserialize, Serialize};
-use servo::WebView;
-use servo_url::ServoUrl;
+use servo::{WebView, WebViewId};
 
 /// Tab state
 pub struct Tab {
     /// Tab WebView
     webview: WebView,
-    /// History
-    history: TabHistory,
     // /// Prompt
     // prompt: Option<PromptDialog>,
     /// Title
@@ -24,10 +20,6 @@ impl Tab {
     pub fn new(webview: WebView) -> Self {
         Self {
             webview,
-            history: TabHistory {
-                list: Vec::new(),
-                current_idx: 0,
-            },
             // prompt: None,
             title: "null".to_string(),
         }
@@ -46,16 +38,6 @@ impl Tab {
     /// Set tab WebView size.
     pub fn set_webview_size(&mut self, size: PhysicalSize<u32>) {
         self.webview.resize(size);
-    }
-
-    /// Get tab history.
-    pub fn history(&self) -> &TabHistory {
-        &self.history
-    }
-
-    /// Set tab history.
-    pub fn set_history(&mut self, list: Vec<ServoUrl>, current_idx: usize) {
-        self.history = TabHistory { list, current_idx };
     }
 
     // /// Get tab prompt dialog.
@@ -180,7 +162,12 @@ impl TabManager {
     /// Close a tab.
     pub fn close_tab(&mut self, id: WebViewId) -> Result<Tab, TabManagerErr> {
         match self.tab_map.remove(&id) {
-            Some(tab) => Ok(tab),
+            Some(tab) => {
+                if self.active_tab_id == Some(id) {
+                    self.active_tab_id = self.tab_map.keys().next().copied();
+                }
+                Ok(tab)
+            },
             None => Err(TabManagerErr::WebViewIdNotFound),
         }
     }
@@ -205,17 +192,11 @@ impl TabManager {
         }
     }
 
-    /* History */
-
-    /// Get tab history.
-    pub fn history(&self, tab_id: WebViewId) -> Option<&TabHistory> {
-        self.tab_map.get(&tab_id).map(|tab| tab.history())
-    }
-    /// Set tab history.
-    pub fn set_history(&mut self, tab_id: WebViewId, list: Vec<ServoUrl>, current_idx: usize) {
+    /// Set the title of a tab.
+    pub fn set_title(&mut self, tab_id: WebViewId, title: String) {
         if let Some(tab) = self.tab_map.get_mut(&tab_id) {
-            tab.set_history(list, current_idx);
-        };
+            tab.set_title(title);
+        }
     }
 
     // /* Prompt */
@@ -274,14 +255,6 @@ impl Default for TabManager {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Tab history
-pub struct TabHistory {
-    /// History list
-    pub list: Vec<ServoUrl>,
-    /// Current index
-    pub current_idx: usize,
 }
 
 /// Tab manager errors.

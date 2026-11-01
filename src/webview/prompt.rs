@@ -1,313 +1,143 @@
-use base::{generic_channel::GenericSender, id::WebViewId};
-use constellation_traits::EmbedderToConstellationMessage;
-use crossbeam_channel::Sender;
-use dpi::PhysicalSize;
-use embedder_traits::{
-    AlertResponse, AllowOrDeny, AuthenticationResponse, ConfirmResponse, PromptResponse,
-    ViewportDetails,
+use std::rc::Rc;
+
+use serde::Deserialize;
+use servo::{
+    AlertDialog, AuthenticationRequest, ConfirmDialog, EmbedderControlId,
+    OffscreenRenderingContext, PermissionRequest, PromptDialog as ServoPromptDialog, WebView,
+    WebViewId,
 };
-use euclid::Scale;
-use serde::{Deserialize, Serialize};
-use servo_url::ServoUrl;
-use webrender_api::units::DeviceRect;
+use url::Url;
 
-use crate::{verso::send_to_constellation, webview::WebView};
+/// Logical size of the prompt overlay. The prompt pages center a 300px wide dialog.
+pub(crate) const PROMPT_LOGICAL_SIZE: (f64, f64) = (320.0, 200.0);
 
-/// Prompt Type
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-enum PromptType {
-    /// Alert dialog
-    ///
-    /// <https://developer.mozilla.org/en-US/docs/Web/API/Window/alert>
-    Alert(String),
-    /// Confitm dialog, Ok/Cancel
-    ///
-    /// <https://developer.mozilla.org/en-US/docs/Web/API/Window/confirm>
-    OkCancel(String),
-    /// Confirm dialog, Allow/Deny
-    ///
-    /// <https://developer.mozilla.org/en-US/docs/Web/API/Window/confirm>
-    AllowDeny(String),
-    /// Input dialog
-    ///
-    /// <https://developer.mozilla.org/en-US/docs/Web/API/Window/prompt>
-    Input(String, Option<String>),
-    /// HTTP basic authentication dialog (username / password)
-    ///
-    /// <https://developer.mozilla.org/en-US/docs/Web/HTTP/Authentication#basic>
-    HttpBasicAuth,
+/// A request from web content that waits for the user to answer a prompt page.
+pub(crate) enum PendingPrompt {
+    /// `window.alert()`
+    Alert(AlertDialog),
+    /// `window.confirm()`
+    Confirm(ConfirmDialog),
+    /// `window.prompt()`
+    Input(ServoPromptDialog),
+    /// A permission request, answered with allow or deny
+    Permission(PermissionRequest),
+    /// An HTTP authentication request
+    Authentication(AuthenticationRequest),
 }
 
-/// Prompt Sender, used to send prompt result back to the caller
-#[derive(Clone)]
-pub enum PromptSender {
-    /// Alert sender
-    AlertSender(GenericSender<AlertResponse>),
-    /// Ok/Cancel, Yes/No sender
-    ConfirmSender(GenericSender<ConfirmResponse>),
-    /// Input sender
-    InputSender(GenericSender<PromptResponse>),
-    /// Allow/Deny Permission sender
-    AllowDenySender(GenericSender<AllowOrDeny>),
-    /// HTTP basic authentication sender
-    HttpBasicAuthSender(GenericSender<Option<AuthenticationResponse>>),
-}
+impl PendingPrompt {
+    /// The prompt page that presents this request.
+    pub(crate) fn resource_url(&self) -> Url {
+        let (page, message, default_value) = match self {
+            PendingPrompt::Alert(dialog) => ("alert.html", Some(dialog.message().to_owned()), None),
+            PendingPrompt::Confirm(dialog) => {
+                ("ok_cancel.html", Some(dialog.message().to_owned()), None)
+            },
+            PendingPrompt::Input(dialog) => (
+                "prompt.html",
+                Some(dialog.message().to_owned()),
+                Some(dialog.current_value().to_owned()),
+            ),
+            PendingPrompt::Permission(request) => (
+                "allow_deny.html",
+                Some(format!("Allow this site to use {:?}?", request.feature())),
+                None,
+            ),
+            PendingPrompt::Authentication(_) => ("http_basic_auth.html", None, None),
+        };
+        let mut url = Url::parse("verso://resources/components/prompt/")
+            .and_then(|base| base.join(page))
+            .expect("prompt page URL is valid");
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(message) = message {
+                query.append_pair("msg", &message);
+            }
+            if let Some(default_value) = default_value {
+                query.append_pair("defaultValue", &default_value);
+            }
+        }
+        url
+    }
 
-/// Prompt input result send from prompt dialog to backend
-/// - action: "ok" / "cancel"
-/// - value: user input value in input prompt
-///
-/// Behavior:
-/// - **Ok**: return string, or an empty string if user leave input empty
-/// - **Cancel**: return null
-///
-/// <https://developer.mozilla.org/en-US/docs/Web/API/Window/prompt#return_value>
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PromptInputResult {
-    /// User action: "ok" / "cancel"
-    pub action: String,
-    /// User input value
-    pub value: String,
-}
-
-/// Prompt input result send from prompt dialog to backend
-/// - action: "signin" / "cancel"
-/// - auth: { username: string, password: string }
-///
-/// Behavior:
-/// - **signin**: return { username: string, password: string }
-/// - **cancel**: return { username: null, password: null }
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HttpBasicAuthInputResult {
-    /// User action: "signin" / "cancel"
-    pub action: String,
-    /// User input value
-    pub auth: AuthenticationResponse,
-}
-
-/// Prompt Dialog
-#[derive(Clone)]
-pub struct PromptDialog {
-    webview: WebView,
-    prompt_sender: Option<PromptSender>,
-}
-
-impl PromptDialog {
-    /// New prompt dialog
-    pub fn new() -> Self {
-        PromptDialog {
-            webview: WebView::new(WebViewId::new(), ViewportDetails::default()),
-            prompt_sender: None,
+    /// Answer the request with the result the prompt page sent through `window.alert`.
+    pub(crate) fn respond(self, result: &str) {
+        match self {
+            PendingPrompt::Alert(dialog) => dialog.confirm(),
+            PendingPrompt::Confirm(dialog) => match result {
+                "ok" => dialog.confirm(),
+                _ => dialog.dismiss(),
+            },
+            PendingPrompt::Input(mut dialog) => match serde_json::from_str::<PromptInputResult>(result)
+            {
+                Ok(PromptInputResult { action, value }) if action == "ok" => {
+                    dialog.set_current_value(&value);
+                    dialog.confirm();
+                },
+                Ok(_) => dialog.dismiss(),
+                Err(error) => {
+                    log::error!("Invalid prompt result {result:?}: {error}");
+                    dialog.dismiss();
+                },
+            },
+            PendingPrompt::Permission(request) => match result {
+                "allow" => request.allow(),
+                _ => request.deny(),
+            },
+            PendingPrompt::Authentication(request) => {
+                match serde_json::from_str::<HttpBasicAuthInputResult>(result) {
+                    Ok(HttpBasicAuthInputResult { action, auth }) if action == "signin" => {
+                        request.authenticate(auth.username, auth.password);
+                    },
+                    Ok(_) => {},
+                    Err(error) => log::error!("Invalid authentication result {result:?}: {error}"),
+                }
+            },
         }
     }
-    /// Get prompt webview
-    pub fn webview(&self) -> &WebView {
-        &self.webview
-    }
-    /// Get prompt webview ID
-    pub fn id(&self) -> WebViewId {
-        self.webview.webview_id
-    }
+}
 
-    /// Get prompt sender. Send user interaction result back to caller.
-    pub fn sender(&self) -> Option<PromptSender> {
-        self.prompt_sender.clone()
-    }
+/// A prompt page shown over the content area of a window, answering a request from a tab.
+///
+/// Dropping it without calling [`PendingPrompt::respond`] gives Servo its default answer.
+pub(crate) struct Prompt {
+    /// The webview that shows the prompt page
+    pub(crate) webview: WebView,
+    /// Framebuffer the prompt page paints into
+    pub(crate) rendering_context: Rc<OffscreenRenderingContext>,
+    /// The tab that asked for the prompt
+    pub(crate) parent: WebViewId,
+    /// The embedder control id of a simple dialog, so Servo can cancel it
+    pub(crate) control_id: Option<EmbedderControlId>,
+    /// The request to answer
+    pub(crate) pending: Option<PendingPrompt>,
+}
 
-    /// Resize prompt webview size with new window context size
-    ///
-    /// ## Example:
-    /// ```rust
-    /// let rect = window.webview.as_ref().unwrap().rect;
-    /// let content_size = window.get_content_size(rect);
-    /// prompt.set_size(content_size);
-    /// ```
-    pub fn set_size(&mut self, size: PhysicalSize<u32>) {
-        self.webview.set_size(size);
-    }
-
-    /// Show alert prompt.
-    ///
-    /// After you call `alert(..)`, you must call `sender()` to get prompt sender,
-    /// then send user interaction result back to caller.
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// if let Some(PromptSender::AlertSender(sender)) = prompt.sender() {
-    ///     let _ = sender.send(());
-    /// }
-    /// ```
-    pub fn alert(
-        &mut self,
-        sender: &Sender<EmbedderToConstellationMessage>,
-        rect: DeviceRect,
-        scale_factor: f32,
-        message: String,
-        prompt_sender: GenericSender<AlertResponse>,
-    ) {
-        self.prompt_sender = Some(PromptSender::AlertSender(prompt_sender));
-        self.show(sender, rect, scale_factor, PromptType::Alert(message));
-    }
-
-    /// Show Ok/Cancel confirm prompt
-    ///
-    /// After you call `ok_cancel(..)`, you must call `sender()` to get prompt sender,
-    /// then send user interaction result back to caller.
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// if let Some(PromptSender::ConfirmSender(sender)) = prompt.sender() {
-    ///     let _ = sender.send(PromptResult::Primary);
-    /// }
-    /// ```
-    pub fn ok_cancel(
-        &mut self,
-        sender: &Sender<EmbedderToConstellationMessage>,
-        rect: DeviceRect,
-        scale_factor: f32,
-        message: String,
-        prompt_sender: GenericSender<ConfirmResponse>,
-    ) {
-        self.prompt_sender = Some(PromptSender::ConfirmSender(prompt_sender));
-        self.show(sender, rect, scale_factor, PromptType::OkCancel(message));
-    }
-
-    /// Show Yes/No confirm prompt
-    ///
-    /// After you call `allow_deny(..)`, you must call `sender()` to get prompt sender,
-    /// then send user interaction result back to caller.
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// let mut prompt = PromptDialog::new();
-    /// prompt.allow_deny(sender, rect, message, prompt_sender);
-    /// if let Some(PromptSender::AllowDenySender(sender)) = prompt.sender() {
-    ///     let _ = sender.send(AllowOrDeny::Allow);
-    /// }
-    /// ```
-    pub fn allow_deny(
-        &mut self,
-        sender: &Sender<EmbedderToConstellationMessage>,
-        rect: DeviceRect,
-        scale_factor: f32,
-        message: String,
-        prompt_sender: PromptSender,
-    ) {
-        self.prompt_sender = Some(prompt_sender);
-        self.show(sender, rect, scale_factor, PromptType::AllowDeny(message));
-    }
-
-    /// Show input prompt
-    ///
-    /// After you call `input(..)`, you must call `sender()` to get prompt sender,
-    /// then send user interaction result back to caller.
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// if let Some(PromptSender::InputSender(sender)) = prompt.sender() {
-    ///     let _ = sender.send(Some("user input value".to_string()));
-    /// }
-    /// ```
-    pub fn input(
-        &mut self,
-        sender: &Sender<EmbedderToConstellationMessage>,
-        rect: DeviceRect,
-        scale_factor: f32,
-        message: String,
-        default_value: Option<String>,
-        prompt_sender: GenericSender<PromptResponse>,
-    ) {
-        self.prompt_sender = Some(PromptSender::InputSender(prompt_sender));
-        self.show(
-            sender,
-            rect,
-            scale_factor,
-            PromptType::Input(message, default_value),
-        );
-    }
-
-    /// Show input prompt
-    ///
-    /// After you call `input(..)`, you must call `sender()` to get prompt sender,
-    /// then send user interaction result back to caller.
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// if let Some(PromptSender::HttpBasicAuthSender(sender)) = prompt.sender() {
-    ///     let _ = sender.send(AuthenticationResponse {
-    ///         username: "user".to_string(),
-    ///         password: "password".to_string(),
-    ///     });
-    /// }
-    /// ```
-    pub fn http_basic_auth(
-        &mut self,
-        sender: &Sender<EmbedderToConstellationMessage>,
-        rect: DeviceRect,
-        scale_factor: f32,
-        prompt_sender: GenericSender<Option<AuthenticationResponse>>,
-    ) {
-        self.prompt_sender = Some(PromptSender::HttpBasicAuthSender(prompt_sender));
-        self.show(sender, rect, scale_factor, PromptType::HttpBasicAuth);
-    }
-
-    fn show(
-        &mut self,
-        sender: &Sender<EmbedderToConstellationMessage>,
-        rect: DeviceRect,
-        scale_factor: f32,
-        prompt_type: PromptType,
-    ) {
-        self.webview.set_size(rect);
-
-        let hidpi_scale_factor = Scale::new(scale_factor);
-        let size = rect.size().to_f32() / hidpi_scale_factor;
-        send_to_constellation(
-            sender,
-            EmbedderToConstellationMessage::NewWebView(
-                self.resource_url(prompt_type),
-                self.webview.webview_id,
-                ViewportDetails {
-                    size,
-                    hidpi_scale_factor,
-                },
-            ),
-        );
-    }
-
-    fn resource_url(&self, prompt_type: PromptType) -> ServoUrl {
-        let url = match prompt_type {
-            PromptType::Alert(msg) => {
-                format!("verso://resources/components/prompt/alert.html?msg={msg}")
-            }
-            PromptType::OkCancel(msg) => {
-                format!("verso://resources/components/prompt/ok_cancel.html?msg={msg}")
-            }
-            PromptType::AllowDeny(msg) => {
-                format!("verso://resources/components/prompt/allow_deny.html?msg={msg}")
-            }
-            PromptType::Input(msg, default_value) => {
-                let mut url = format!("verso://resources/components/prompt/prompt.html?msg={msg}");
-                if let Some(default_value) = default_value {
-                    url.push_str(&format!("&defaultValue={}", default_value));
-                }
-                url
-            }
-            PromptType::HttpBasicAuth => {
-                "verso://resources/components/prompt/http_basic_auth.html".to_string()
-            }
-        };
-        ServoUrl::parse(&url).unwrap()
+impl Prompt {
+    /// Answer the pending request with the prompt page's result.
+    pub(crate) fn respond(&mut self, result: &str) {
+        if let Some(pending) = self.pending.take() {
+            pending.respond(result);
+        }
     }
 }
 
-impl Default for PromptDialog {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Result sent by `prompt.html`: `{ action: "ok" | "cancel", value }`.
+#[derive(Debug, Deserialize)]
+struct PromptInputResult {
+    action: String,
+    value: String,
+}
+
+/// Result sent by `http_basic_auth.html`: `{ action: "signin" | "cancel", auth }`.
+#[derive(Debug, Deserialize)]
+struct HttpBasicAuthInputResult {
+    action: String,
+    auth: Credentials,
+}
+
+#[derive(Debug, Deserialize)]
+struct Credentials {
+    username: String,
+    password: String,
 }

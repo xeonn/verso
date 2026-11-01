@@ -4,7 +4,7 @@
 
 #![allow(missing_docs)]
 
-use embedder_traits::KeyboardEvent;
+use servo::KeyboardEvent;
 use keyboard_types::{Code, Key, KeyState, Location, Modifiers, NamedKey};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{

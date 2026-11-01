@@ -21,8 +21,14 @@ impl ApplicationHandler<EventLoopProxyMessage> for App {
     }
 
     fn exiting(&mut self, _event_loop: &event_loop::ActiveEventLoop) {
-        if let Some(v) = self.verso.as_mut() {
+        if let Some(v) = self.verso.take() {
             v.before_shutdown();
+            v.close_all_windows();
+            // Dropping the last `Verso` handle drops `Servo`, which shuts Servo down.
+            if Rc::strong_count(&v) > 1 {
+                log::warn!("Verso is still referenced at exit; Servo will not shut down cleanly");
+            }
+            drop(v);
         }
     }
 

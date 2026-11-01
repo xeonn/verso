@@ -10,7 +10,7 @@ repository = "https://github.com/versotile-org/verso"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
-ipc-channel = "0.20"
+ipc-channel = "0.23"
 bincode = "1"
 url = { version = "2.5.2", features = ["serde"] }
 log = "0.4"
@@ -57,18 +57,10 @@ targets = [
 ]
 
 [features]
-default = ["vello_cpu"]
-bluetooth = [
-    "bluetooth_traits",
-    "dep:bluetooth",
-    "constellation/bluetooth",
-    "constellation_traits/bluetooth",
-    "script/bluetooth",
-    "script_traits/bluetooth",
-]
-background_hang_monitor = ["background_hang_monitor/sampler"]
-vello = ["libservo/vello"]
-vello_cpu = ["libservo/vello_cpu"]
+default = []
+bluetooth = ["servo/bluetooth"]
+background_hang_monitor = ["servo/background_hang_monitor"]
+vello = ["servo/vello"]
 packager = ["dep:cargo-packager-resource-resolver"]
 flatpak = []
 tracing = []
@@ -87,13 +79,13 @@ getopts = "0.2.17"
 # glutin = "0.32.0"
 # glutin-winit = "0.5.0"
 ipc-channel = { workspace = true }
-keyboard-types = { version = "0.8.0", features = ["webdriver", "serde"] }
+keyboard-types = { version = "0.8.3", features = ["webdriver", "serde"] }
 log = { workspace = true }
 raw-window-handle = { version = "0.6", features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 sparkle = "0.1.26"
 thiserror = "2"
-winit = { version = "0.30", features = ["rwh_06"] }
+winit = { version = "0.30.13", features = ["rwh_06"] }
 dpi = { workspace = true }
 url = { workspace = true }
 headers = { workspace = true }
@@ -108,36 +100,13 @@ rfd = "0.15"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 tokio = { version = "1", features = ["full"] }
 bitflags = "2.9"
-surfman = "0.11"
-# Servo repo crates
-libservo = { git = "https://github.com/servo/servo.git", rev = "0e998ba", features = ["no-wgl"] }
-background_hang_monitor = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-base = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-bluetooth = { git = "https://github.com/servo/servo.git", rev = "0e998ba", optional = true }
-bluetooth_traits = { git = "https://github.com/servo/servo.git", rev = "0e998ba", optional = true }
-compositing_traits = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-constellation = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-constellation_traits = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-devtools = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-embedder_traits = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-fonts = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-layout = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-media = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-net = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-net_traits = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-profile = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-profile_traits = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-script = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-script_traits = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-servo_allocator = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-servo_config = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-servo_geometry = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-servo_url = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-webdriver_server = { git = "https://github.com/servo/servo.git", rev = "0e998ba" }
-# Servo org crates
-servo-media = { git = "https://github.com/servo/media" }
-servo-media-dummy = { git = "https://github.com/servo/media" }
-webrender_api = { git = "https://github.com/servo/webrender", branch = "0.68" }
+surfman = "0.14"
+servo = { version = "0.7.0", features = [
+  "brotli-compression-stream",
+  "webcrypto",
+  "webgl",
+  "webgpu",
+] }
 # Packager feature
 cargo-packager-resource-resolver = { version = "0.1.1", features = [
   "auto-detect-format",

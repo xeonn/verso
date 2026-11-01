@@ -4,19 +4,12 @@ use std::{
 };
 
 use dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use embedder_traits::resources::{self, Resource, ResourceReaderMethods};
-use embedder_traits::user_content_manager::UserScript as ServoUserScript;
 use headers::{ContentType, HeaderMapExt};
-use net::protocols::{ProtocolHandler, ProtocolRegistry};
-use net_traits::{
-    ResourceFetchTiming,
-    request::Request,
-    response::{Response, ResponseBody},
+use servo::protocol_handler::{
+    DoneChannel, FetchContext, NetworkError, ProtocolHandler, ProtocolRegistry, Request,
+    ResourceFetchTiming, Response, ResponseBody,
 };
-use servo_config::{
-    opts::{Opts, OutputOptions},
-    prefs::Preferences,
-};
+use servo::{Opts, OutputOptions, Preferences, UserScript as ServoUserScript};
 use versoview_messages::{ConfigFromController, CustomProtocol, UserScript};
 use winit::window::{Fullscreen, WindowAttributes};
 
@@ -398,9 +391,8 @@ impl Config {
             user_scripts: config
                 .user_scripts
                 .into_iter()
-                .map(|userscript| ServoUserScript {
-                    script: userscript.script,
-                    source_file: userscript.source_file,
+                .map(|userscript| {
+                    ServoUserScript::new(userscript.script, userscript.source_file)
                 })
                 .collect(),
             zoom_level: config.zoom_level,
@@ -429,9 +421,6 @@ impl Config {
 
     /// Init options and preferences.
     pub fn init(&self) -> (Opts, Preferences) {
-        // Set the resource files of Servo.
-        resources::set(Box::new(ResourceReader(self.resource_dir.clone())));
-
         let mut opts = Opts::default();
 
         if let Some(ref profiler_settings) = self.profiler_settings {
@@ -439,26 +428,15 @@ impl Config {
             opts.time_profiler_trace_path = profiler_settings.trace_path.clone();
         }
 
-        // Set the global options of Servo.
-        // initialize_options(opts);
-
-        let (devtools_server_enabled, devtools_port) =
-            if let Some(devtools_port) = self.devtools_port {
-                (true, devtools_port)
-            } else {
-                (false, 0)
-            };
-
-        // Set the preferences of Servo.
-        // servo_config::prefs::set(
-        let preference = Preferences {
-            devtools_server_enabled,
-            devtools_server_port: devtools_port as i64,
-            dom_notification_enabled: true, // experimental feature
+        let mut preference = Preferences {
+            dom_notification_enabled: true,
             user_agent: self.user_agent.clone(),
             ..Default::default()
         };
-        // );
+        if let Some(devtools_port) = self.devtools_port {
+            preference.devtools_server_enabled = true;
+            preference.devtools_server_listen_address = devtools_port.to_string();
+        }
 
         (opts, preference)
     }
@@ -485,61 +463,29 @@ fn load_userscripts(
 
 struct ResourceReader(PathBuf);
 
-impl ResourceReaderMethods for ResourceReader {
-    fn read(&self, resource: Resource) -> Vec<u8> {
-        let path = self.0.join(resource.filename());
-        fs::read(&path).unwrap_or_else(|_| {
-            match resource {
-                // Rigppy image is the only one needs to be valid bytes.
-                // Others can be empty and Servo will set to default.
-                Resource::BrokenImageIcon => &include_bytes!("../resources/rippy.png")[..],
-                Resource::HstsPreloadList => {
-                    log::warn!(
-                        "HSTS preload list not found, falling back to an empty list, to set this, put the list at '{}'",
-                        path.display()
-                    );
-                    // This is made out of
-                    //
-                    // ```
-                    // let mut wtr = std::io::BufWriter::new(std::fs::File::create("map.fst")?);
-                    // let mut build = fst::MapBuilder::new(wtr)?;
-                    // build.finish()?;
-                    // ```
-                    b"\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x12\x00\x00\x00\x00\x00\x00\x00Tk-\x0f"
-                }
-                _ => &[],
-            }
-            .to_vec()
-        })
-    }
-
-    fn sandbox_access_files(&self) -> Vec<PathBuf> {
-        vec![]
-    }
-
-    fn sandbox_access_files_dirs(&self) -> Vec<PathBuf> {
-        vec![]
-    }
-}
-
 impl ProtocolHandler for ResourceReader {
-    fn load(
-        &self,
-        request: &mut Request,
-        _done_chan: &mut net::fetch::methods::DoneChannel,
-        _context: &net::fetch::methods::FetchContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    fn load<'a>(
+        &'a self,
+        request: &'a mut Request,
+        _done_chan: &mut DoneChannel,
+        _context: &FetchContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + 'a>> {
         let current_url = request.current_url();
-        let path = current_url.path();
-        let path = self.0.join(path.strip_prefix('/').unwrap_or(path));
+        let relative = current_url.path();
+        let relative = relative.strip_prefix('/').unwrap_or(relative);
+        let mut path = self.0.join(relative);
+        if !path.exists()
+            && let Some(stripped) = relative.strip_prefix("resources/")
+        {
+            path = self.0.join(stripped);
+        }
 
-        let response = if let Ok(file) = fs::read(path.clone()) {
+        let response = if let Ok(file) = fs::read(&path) {
             let mut response = Response::new(
-                request.current_url(),
+                current_url,
                 ResourceFetchTiming::new(request.timing_type()),
             );
 
-            // Set Content-Type header.
             if let Some(ext) = path.extension() {
                 match ext.to_str() {
                     Some("css") => response
@@ -554,11 +500,13 @@ impl ProtocolHandler for ResourceReader {
                 }
             }
 
-            *response.body.lock().unwrap() = ResponseBody::Done(file);
+            *response.body.lock() = ResponseBody::Done(file);
 
             response
         } else {
-            Response::network_internal_error("Opening file failed")
+            Response::network_error(NetworkError::ResourceLoadError(
+                "Opening file failed".to_owned(),
+            ))
         };
 
         Box::pin(std::future::ready(response))
@@ -569,14 +517,16 @@ struct CustomProtocolHandler(CustomProtocol);
 
 impl ProtocolHandler for CustomProtocolHandler {
     #[allow(unused_variables)]
-    fn load(
-        &self,
-        request: &mut Request,
-        done_chan: &mut net::fetch::methods::DoneChannel,
-        context: &net::fetch::methods::FetchContext,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Response> + Send>> {
-        Box::pin(std::future::ready(Response::network_internal_error(
-            "This should be handled through `on_web_resource_requested` instead",
+    fn load<'a>(
+        &'a self,
+        _request: &'a mut Request,
+        _done_chan: &mut DoneChannel,
+        _context: &FetchContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + 'a>> {
+        Box::pin(std::future::ready(Response::network_error(
+            NetworkError::ResourceLoadError(
+                "This should be handled through `on_web_resource_requested` instead".to_owned(),
+            ),
         )))
     }
 

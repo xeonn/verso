@@ -1,14 +1,12 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use constellation_traits::EmbedderToConstellationMessage;
-use crossbeam_channel::Sender;
-use embedder_traits::{
-    EventLoopWaker, WebResourceResponse, WebResourceResponseMsg,
-    user_content_manager::UserContentManager,
-};
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
-use servo::{AllowOrDenyRequest, Servo, ServoBuilder, ServoDelegate, ServoError};
+use serde::{Deserialize, Serialize};
+use servo::{
+    AllowOrDenyRequest, EventLoopWaker, Servo, ServoBuilder, ServoDelegate, ServoError,
+    UserContentManager, WebResourceResponse,
+};
 use versoview_messages::{PositionType, SizeType, ToControllerMessage, ToVersoMessage};
 use winit::{
     event::WindowEvent,
@@ -17,29 +15,36 @@ use winit::{
 };
 
 use crate::{
+    bookmark::BookmarkManager,
     config::{Config, parse_cli_args, to_winit_theme, to_winit_window_level},
+    download::{DownloadId, DownloadItem, UpdateDownloadState},
+    storage::Storage,
     window::Window,
 };
 
 /// Main entry point of Verso browser.
 pub struct Verso {
     pub(crate) servo: Servo,
+    pub(crate) user_content_manager: Rc<UserContentManager>,
     pub(crate) windows: RefCell<HashMap<WindowId, Window>>,
     to_controller_sender: Option<IpcSender<ToControllerMessage>>,
-    config: Config,
+    pub(crate) config: Config,
+    bookmark_manager: RefCell<BookmarkManager>,
+    storage: Storage,
+    downloads: RefCell<HashMap<DownloadId, DownloadItem>>,
 }
 
 struct VersoServoDelegate;
 impl ServoDelegate for VersoServoDelegate {
-    fn notify_devtools_server_started(&self, _servo: &Servo, port: u16, _token: String) {
+    fn notify_devtools_server_started(&self, port: u16, _token: String) {
         log::info!("Devtools Server running on port {port}");
     }
 
-    fn request_devtools_connection(&self, _servo: &Servo, request: AllowOrDenyRequest) {
+    fn request_devtools_connection(&self, request: AllowOrDenyRequest) {
         request.allow();
     }
 
-    fn notify_error(&self, _servo: &Servo, error: ServoError) {
+    fn notify_error(&self, error: ServoError) {
         log::error!("Saw Servo error: {error:?}!");
     }
 }
@@ -70,35 +75,37 @@ impl Verso {
         let with_panel = config.with_panel;
         let window_settings = config.window_attributes.clone();
         let user_scripts = config.user_scripts.clone();
-        let zoom_level = config.zoom_level;
 
         let mut window = Window::new(evl, window_settings);
         let event_loop_waker = Box::new(Waker(proxy));
 
         let (opts, preferences) = config.init();
-        let mut user_content_manager = UserContentManager::new();
-        for script in user_scripts {
-            user_content_manager.add_script(script);
-        }
-
-        let servo_builder = ServoBuilder::new(window.rendering_context.clone())
+        let servo = ServoBuilder::default()
             .opts(opts)
             .preferences(preferences)
-            .user_content_manager(user_content_manager)
             .protocol_registry(protocols)
-            .event_loop_waker(event_loop_waker);
-        let servo: Servo = servo_builder.build();
+            .event_loop_waker(event_loop_waker)
+            .build();
         servo.setup_logging();
         servo.set_delegate(Rc::new(VersoServoDelegate));
+
+        let user_content_manager = Rc::new(UserContentManager::new(&servo));
+        for script in user_scripts {
+            user_content_manager.add_script(Rc::new(script));
+        }
 
         let windows = HashMap::new();
 
         // Create Verso instance
         let verso = Rc::new(Verso {
             servo,
+            user_content_manager,
             windows: windows.into(),
             to_controller_sender,
             config,
+            bookmark_manager: RefCell::new(BookmarkManager::new()),
+            storage: Storage::new(),
+            downloads: RefCell::new(HashMap::new()),
         });
 
         if with_panel {
@@ -122,26 +129,26 @@ impl Verso {
     ) {
         #[cfg(linux)]
         if let WindowEvent::Resized(_) = event {
-            self.handle_winit_window_event(window_id, event);
+            self.handle_winit_window_event(event_loop, window_id, event);
         } else {
-            self.handle_winit_window_event(window_id, event);
+            self.handle_winit_window_event(event_loop, window_id, event);
             self.handle_servo_messages(event_loop);
         }
 
         #[cfg(apple)]
         if let WindowEvent::RedrawRequested = event {
-            let resizing = self.handle_winit_window_event(window_id, event);
+            let resizing = self.handle_winit_window_event(event_loop, window_id, event);
             if !resizing {
                 self.handle_servo_messages(event_loop);
             }
         } else {
-            self.handle_winit_window_event(window_id, event);
+            self.handle_winit_window_event(event_loop, window_id, event);
             self.handle_servo_messages(event_loop);
         }
 
         #[cfg(windows)]
         {
-            self.handle_winit_window_event(window_id, event);
+            self.handle_winit_window_event(event_loop, window_id, event);
             self.handle_servo_messages(event_loop);
         }
 
@@ -151,48 +158,49 @@ impl Verso {
     /// Handle Winit window events
     fn handle_winit_window_event(
         self: &mut Rc<Self>,
+        event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
     ) -> bool {
         log::trace!("Verso is handling Winit event: {event:?}");
 
+        if let WindowEvent::CloseRequested = &event {
+            let defer_to_controller = {
+                let windows = self.windows.borrow();
+                let Some(window) = windows.get(&window_id) else {
+                    return false;
+                };
+                self.to_controller_sender
+                    .as_ref()
+                    .is_some_and(|sender| window.event_listeners.on_close_requested && {
+                        if let Err(error) = sender.send(ToControllerMessage::OnCloseRequested) {
+                            log::error!("Verso failed to send close request to controller: {error}");
+                            false
+                        } else {
+                            true
+                        }
+                    })
+            };
+            if !defer_to_controller {
+                self.close_all_windows();
+                event_loop.exit();
+            }
+            return false;
+        }
+
         let mut windows = self.windows.borrow_mut();
         let Some(window) = windows.get_mut(&window_id) else {
             return false;
         };
-
-        if let WindowEvent::CloseRequested = event {
-            if let Some(to_controller_sender) = &self.to_controller_sender {
-                if window.event_listeners.on_close_requested {
-                    if let Err(error) =
-                        to_controller_sender.send(ToControllerMessage::OnCloseRequested)
-                    {
-                        log::error!(
-                            "Verso failed to send WebResourceRequested to controller: {error}"
-                        );
-                    } else {
-                        return false;
-                    }
-                }
-            }
-            // self.windows.remove(&window_id);
-            self.servo.start_shutting_down();
-            event_loop.exit();
-        } else {
-            window.handle_winit_window_event(&self, &event);
-            return window.resizing;
-        }
-
-        false
+        window.handle_winit_window_event(self, &event);
+        window.resizing
     }
 
     /// Handle message came from Servo.
     pub fn handle_servo_messages(self: &mut Rc<Self>, event_loop: &ActiveEventLoop) {
-        let should_shutdown = self.servo.spin_event_loop();
+        self.servo.spin_event_loop();
 
-        if should_shutdown {
-            event_loop.exit();
-        } else if self.is_animating() {
+        if self.is_animating() {
             event_loop.set_control_flow(ControlFlow::Poll);
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
@@ -248,6 +256,12 @@ impl Verso {
         event_loop: &ActiveEventLoop,
         message: ToVersoMessage,
     ) {
+        if let ToVersoMessage::Exit = message {
+            self.close_all_windows();
+            event_loop.exit();
+            return;
+        }
+
         // We only use the first window for now
         let mut windows = self.windows.borrow_mut();
         let Some(window) = windows.values_mut().next().map(|window| window) else {
@@ -257,13 +271,7 @@ impl Verso {
         let webview = window.tab_manager.current_tab().map(|tab| tab.webview());
 
         match message {
-            ToVersoMessage::Exit => {
-                // if let Some(compositor) = &mut self.compositor {
-                //     compositor.start_shutting_down();
-                //     self.handle_servo_messages(event_loop);
-                // }
-                event_loop.exit();
-            }
+            ToVersoMessage::Exit => unreachable!("handled above"),
             ToVersoMessage::ListenToOnCloseRequested => {
                 window.event_listeners.on_close_requested = true;
             }
@@ -281,13 +289,7 @@ impl Verso {
                 window.event_listeners.on_navigation_starting = true;
             }
             ToVersoMessage::OnNavigationStartingResponse(id, allow) => {
-                // send_to_constellation(
-                //     &self.constellation_sender,
-                //     EmbedderToConstellationMessage::AllowNavigationResponse(
-                //         bincode::deserialize(&id).unwrap(),
-                //         allow,
-                //     ),
-                // );
+                window.answer_navigation(&id, allow);
             }
             ToVersoMessage::ExecuteScript(js) => {
                 if let Some(webview) = webview {
@@ -301,27 +303,21 @@ impl Verso {
                     .replace(HashMap::new());
             }
             ToVersoMessage::WebResourceRequestResponse(response) => {
-                if let Some((url, sender)) = window
+                if let Some(load) = window
                     .event_listeners
                     .on_web_resource_requested
                     .as_mut()
-                    .and_then(|senders| senders.remove(&response.id))
+                    .and_then(|loads| loads.remove(&response.id))
                 {
-                    if let Some(response) = response.response {
-                        let _ = sender
-                            .send(WebResourceResponseMsg::Start(
-                                WebResourceResponse::new(url)
-                                    .headers(response.headers().clone())
-                                    .status_code(response.status()),
-                            ))
-                            .and_then(|_| {
-                                sender.send(WebResourceResponseMsg::SendBodyData(
-                                    response.into_body(),
-                                ))
-                            })
-                            .and_then(|_| sender.send(WebResourceResponseMsg::FinishLoad));
-                    } else {
-                        let _ = sender.send(WebResourceResponseMsg::DoNotIntercept);
+                    if let Some(http_response) = response.response {
+                        let url = load.request().url.clone();
+                        let mut intercepted = load.intercept(
+                            WebResourceResponse::new(url)
+                                .headers(http_response.headers().clone())
+                                .status_code(http_response.status()),
+                        );
+                        intercepted.send_body_data(http_response.into_body());
+                        intercepted.finish();
                     }
                 }
             }
@@ -459,12 +455,12 @@ impl Verso {
             }
             ToVersoMessage::GetCurrentUrl(id) => {
                 let tab = window.tab_manager.current_tab().unwrap();
-                let history = tab.history();
+                let url = tab
+                    .webview()
+                    .url()
+                    .unwrap_or_else(|| url::Url::parse("about:blank").unwrap());
                 if let Err(error) = self.to_controller_sender.as_ref().unwrap().send(
-                    ToControllerMessage::GetCurrentUrlResponse(
-                        id,
-                        history.list[history.current_idx].as_url().clone(),
-                    ),
+                    ToControllerMessage::GetCurrentUrlResponse(id, url),
                 ) {
                     log::error!(
                         "Verso failed to send GetScaleFactorResponse to controller: {error}"
@@ -479,9 +475,76 @@ impl Verso {
         }
     }
 
+    /// Drop every window and its webviews.
+    ///
+    /// Servo 0.7.0 shuts down when the last `Servo` handle is dropped, and every `WebView` holds
+    /// one. Dropping the webviews here lets `Servo` shut down when [`Verso`] itself is dropped.
+    pub fn close_all_windows(&self) {
+        let mut windows = std::mem::take(&mut *self.windows.borrow_mut());
+        for window in windows.values_mut() {
+            window.close_webviews();
+        }
+        drop(windows);
+    }
+
     /// Return true if one of the Verso windows is animating.
     pub fn is_animating(&self) -> bool {
-        self.servo.animating()
+        self.windows
+            .borrow()
+            .values()
+            .any(|window| window.is_animating())
+    }
+
+    /// Load bookmarks saved by a previous session.
+    pub fn init(&self) {
+        let Some(storage) = self.storage.bookmark_storage() else {
+            return;
+        };
+        match storage.load_from_file() {
+            Ok(bookmarks) => self.bookmark_manager.borrow_mut().set_bookmarks(bookmarks),
+            Err(error) => log::debug!("No bookmarks loaded: {error}"),
+        }
+    }
+
+    /// Persist bookmarks before the process exits.
+    pub fn before_shutdown(&self) {
+        let Some(storage) = self.storage.bookmark_storage() else {
+            return;
+        };
+        let bookmarks = self.bookmark_manager.borrow().bookmarks().clone();
+        if let Err(error) = storage.save_to_file(&bookmarks) {
+            log::error!("Failed to save bookmarks: {error}");
+        }
+    }
+
+    /// IPC channel used to talk to a versoview controller, when one is connected.
+    pub(crate) fn controller_sender(&self) -> Option<IpcSender<ToControllerMessage>> {
+        self.to_controller_sender.clone()
+    }
+
+    /// Handle a message sent from a Verso worker thread.
+    pub fn handle_verso_internal_message(&self, message: VersoInternalMsg) {
+        match message {
+            VersoInternalMsg::CreateDownload(download) => {
+                self.downloads
+                    .borrow_mut()
+                    .insert(download.id().clone(), download);
+            }
+            VersoInternalMsg::UpdateDownload(id, state) => {
+                let mut downloads = self.downloads.borrow_mut();
+                if let Some(download) = downloads.get_mut(&id) {
+                    if let Some(status) = state.status {
+                        download.status = status;
+                    }
+                    if let Some(progress) = state.progress {
+                        download.progress = progress;
+                    }
+                    if let Some(stopped) = state.stopped {
+                        download.stopped = stopped;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -556,6 +619,17 @@ pub enum EventLoopProxyMessage {
     Wake,
     /// Message coming from the webview controller
     IpcMessage(Box<ToVersoMessage>),
+    /// Message coming from a Verso worker, such as the download task
+    VersoInternalMessage(VersoInternalMsg),
+}
+
+/// Message sent from Verso's own threads back to the event loop.
+#[derive(Debug, Deserialize, Serialize)]
+pub enum VersoInternalMsg {
+    /// A download has been created.
+    CreateDownload(DownloadItem),
+    /// Progress or status for an existing download.
+    UpdateDownload(DownloadId, UpdateDownloadState),
 }
 
 #[derive(Debug, Clone)]
@@ -573,15 +647,3 @@ impl EventLoopWaker for Waker {
     }
 }
 
-// A logger that logs to two downstream loggers.
-// This should probably be in the log crate.
-
-pub(crate) fn send_to_constellation(
-    sender: &Sender<EmbedderToConstellationMessage>,
-    msg: EmbedderToConstellationMessage,
-) {
-    let variant_name: &str = (&msg).into();
-    if let Err(e) = sender.send(msg) {
-        log::warn!("Sending {variant_name} to constellation failed: {e:?}");
-    }
-}

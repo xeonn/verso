@@ -1,5 +1,9 @@
 target
 Cargo.lock
+
+# graphify
+graphify-out/
+.cursor/rules/graphify.mdc
 .DS_Store
 .vscode/
 .flatpak-builder/
