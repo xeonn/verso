@@ -59,6 +59,7 @@ impl ApplicationHandler<EventLoopProxyMessage> for App {
                 EventLoopProxyMessage::VersoInternalMessage(message) => {
                     v.handle_verso_internal_message(message);
                 }
+                message => v.handle_event_loop_message(event_loop, message),
             }
         }
     }

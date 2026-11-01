@@ -1,18 +1,16 @@
-use std::collections::HashMap;
-
-// use crate::webview::prompt::PromptDialog;
-use dpi::PhysicalSize;
-use serde::{Deserialize, Serialize};
 use servo::{WebView, WebViewId};
+use url::Url;
 
 /// Tab state
 pub struct Tab {
     /// Tab WebView
     webview: WebView,
-    // /// Prompt
-    // prompt: Option<PromptDialog>,
     /// Title
     title: String,
+    /// Session history entries, as reported by `notify_history_changed`
+    history: Vec<Url>,
+    /// Index of the current entry in `history`
+    history_index: usize,
 }
 
 impl Tab {
@@ -20,8 +18,9 @@ impl Tab {
     pub fn new(webview: WebView) -> Self {
         Self {
             webview,
-            // prompt: None,
             title: "null".to_string(),
+            history: Vec::new(),
+            history_index: 0,
         }
     }
 
@@ -35,43 +34,6 @@ impl Tab {
         &self.webview
     }
 
-    /// Set tab WebView size.
-    pub fn set_webview_size(&mut self, size: PhysicalSize<u32>) {
-        self.webview.resize(size);
-    }
-
-    // /// Get tab prompt dialog.
-    // pub fn prompt(&self) -> Option<&PromptDialog> {
-    //     self.prompt.as_ref()
-    // }
-
-    // /// Get tab prompt id.
-    // pub fn prompt_id(&self) -> Option<WebViewId> {
-    //     self.prompt.as_ref().map(|p| p.id())
-    // }
-
-    // /// Set tab prompt dialog.
-    // pub fn set_prompt(&mut self, prompt: PromptDialog) {
-    //     self.prompt = Some(prompt);
-    // }
-
-    // /// Remove tab prompt dialog.
-    // pub fn remove_prompt(&mut self) -> Option<PromptDialog> {
-    //     self.prompt.take()
-    // }
-
-    // /// Check if there is a prompt dialog.
-    // pub fn has_prompt(&self) -> bool {
-    //     self.prompt.is_some()
-    // }
-
-    // /// Set prompt webview size.
-    // pub fn set_prompt_size(&mut self, rect: PhysicalSize<u32>) {
-    //     if let Some(prompt) = self.prompt.as_mut() {
-    //         prompt.set_size(rect);
-    //     }
-    // }
-
     /// Set tab title.
     pub fn set_title(&mut self, title: String) {
         self.title = title;
@@ -81,218 +43,137 @@ impl Tab {
     pub fn title(&self) -> String {
         self.title.clone()
     }
+
+    /// Session history entries before the current one, nearest first.
+    pub fn back_entries(&self) -> Vec<Url> {
+        self.history[..self.history_index.min(self.history.len())]
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
+    }
+
+    /// Session history entries after the current one, nearest first.
+    pub fn forward_entries(&self) -> Vec<Url> {
+        self.history
+            .get(self.history_index + 1..)
+            .map(<[Url]>::to_vec)
+            .unwrap_or_default()
+    }
 }
 
 /// Tab manager to handle multiple tab in a window.
+///
+/// Tabs are kept in the order the panel shows them, so both sides pick the same tab when the
+/// active one closes.
+#[derive(Default)]
 pub struct TabManager {
     /// Current active tab id
     active_tab_id: Option<WebViewId>,
-    /// Tab webview id -> Tab webview
-    tab_map: HashMap<WebViewId, Tab>,
-    /// Prompt webview id -> Parent tab webview id
-    prompt_tab_map: HashMap<WebViewId, WebViewId>,
+    /// Tabs in display order
+    tabs: Vec<Tab>,
 }
 
 impl TabManager {
     /// Create a new tab manager.
     pub fn new() -> Self {
-        Self {
-            active_tab_id: None,
-            tab_map: HashMap::new(),
-            prompt_tab_map: HashMap::new(),
-        }
+        Self::default()
     }
+
     /// Get tab count.
     pub fn count(&self) -> usize {
-        self.tab_map.len()
+        self.tabs.len()
     }
-    /// Get current actvie tab id.
+
+    /// Get current active tab id.
     pub fn current_tab_id(&self) -> Option<WebViewId> {
         self.active_tab_id
     }
+
     /// Get current active tab.
     pub fn current_tab(&self) -> Option<&Tab> {
-        if let Some(tab_id) = self.active_tab_id {
-            self.tab_map.get(&tab_id)
-        } else {
-            None
-        }
-    }
-    /// Get current active tab as mutable.
-    pub fn current_tab_mut(&mut self) -> Option<&mut Tab> {
-        if let Some(tab_id) = self.active_tab_id {
-            self.tab_map.get_mut(&tab_id)
-        } else {
-            None
-        }
-    }
-    /// Get all tab id.
-    pub fn tab_ids(&self) -> Vec<WebViewId> {
-        self.tab_map.keys().cloned().collect()
+        self.active_tab_id.and_then(|id| self.tab(id))
     }
 
-    /// Get all tab id.
-    pub fn tabs(&self) -> std::collections::hash_map::Values<'_, WebViewId, Tab> {
-        self.tab_map.values()
+    /// Get all tab ids, in display order.
+    pub fn tab_ids(&self) -> Vec<WebViewId> {
+        self.tabs.iter().map(Tab::id).collect()
+    }
+
+    /// Get all tabs, in display order.
+    pub fn tabs(&self) -> impl Iterator<Item = &Tab> {
+        self.tabs.iter()
     }
 
     /// Activate the tab by tab id.
     pub fn activate_tab(&mut self, tab_id: WebViewId) -> Option<&Tab> {
-        if let Some(tab) = self.tab_map.get(&tab_id) {
-            self.active_tab_id = Some(tab_id);
-            Some(tab)
-        } else {
-            self.active_tab_id = None;
-            None
-        }
+        let index = self.index_of(tab_id)?;
+        self.active_tab_id = Some(tab_id);
+        self.tabs.get(index)
     }
+
     /// Get tab by tab id.
     pub fn tab(&self, id: WebViewId) -> Option<&Tab> {
-        self.tab_map.get(&id)
+        self.tabs.iter().find(|tab| tab.id() == id)
     }
-    /// Append a tab.
+
+    /// Get mutable tab by tab id.
+    pub fn tab_mut(&mut self, id: WebViewId) -> Option<&mut Tab> {
+        self.tabs.iter_mut().find(|tab| tab.id() == id)
+    }
+
+    /// Append a tab at the end.
     pub fn append_tab(&mut self, webview: WebView, active: bool) {
         let id = webview.id();
-        let tab = Tab::new(webview);
-        self.tab_map.insert(id, tab);
+        self.tabs.push(Tab::new(webview));
         if active {
             self.active_tab_id = Some(id);
         }
     }
-    /// Close a tab.
-    pub fn close_tab(&mut self, id: WebViewId) -> Result<Tab, TabManagerErr> {
-        match self.tab_map.remove(&id) {
-            Some(tab) => {
-                if self.active_tab_id == Some(id) {
-                    self.active_tab_id = self.tab_map.keys().next().copied();
-                }
-                Ok(tab)
-            },
-            None => Err(TabManagerErr::WebViewIdNotFound),
-        }
-    }
-    /// Set tab size. Will also set prompt dialog size if it exists.
-    /// - Returns the tab and prompt WebViewId if they exist.
-    pub fn set_size(
-        &mut self,
-        tab_id: WebViewId,
-        size: PhysicalSize<u32>,
-    ) -> (Option<WebViewId>, Option<WebViewId>) {
-        if let Some(tab) = self.tab_map.get_mut(&tab_id) {
-            tab.set_webview_size(size);
 
-            // if let Some(prompt_id) = tab.prompt_id() {
-            // tab.set_prompt_size(size);
-            // (Some(tab_id), Some(prompt_id))
-            // } else {
-            (Some(tab_id), None)
-            // }
-        } else {
-            (None, None)
-        }
+    /// Close a tab. When it was the active tab, its neighbour becomes active.
+    pub fn close_tab(&mut self, id: WebViewId) -> Option<Tab> {
+        let closed = self.index_of(id)?;
+        let active = self.active_tab_id.and_then(|active| self.index_of(active));
+        let tab = self.tabs.remove(closed);
+        self.active_tab_id = active
+            .and_then(|active| next_active_index(closed, active, self.tabs.len()))
+            .map(|index| self.tabs[index].id());
+        Some(tab)
     }
 
     /// Set the title of a tab.
     pub fn set_title(&mut self, tab_id: WebViewId, title: String) {
-        if let Some(tab) = self.tab_map.get_mut(&tab_id) {
+        if let Some(tab) = self.tab_mut(tab_id) {
             tab.set_title(title);
         }
     }
 
-    // /* Prompt */
-    // /// Get prompt dialog by tab id.
-    // pub fn prompt_by_tab_id(&self, tab_id: WebViewId) -> Option<&PromptDialog> {
-    //     self.tab_map.get(&tab_id).and_then(|tab| tab.prompt())
-    // }
-    // /// Get prompt dialog by tab id.
-    // pub fn prompt_by_prompt_id(&self, prompt_id: WebViewId) -> Option<&PromptDialog> {
-    //     if let Some(tab_id) = self.prompt_tab_map.get(&prompt_id) {
-    //         self.prompt_by_tab_id(*tab_id)
-    //     } else {
-    //         None
-    //     }
-    // }
-    // /// Get current tabw prompt dialog.
-    // pub fn current_prompt(&self) -> Option<&PromptDialog> {
-    //     if let Some(tab_id) = self.active_tab_id {
-    //         self.prompt_by_tab_id(tab_id)
-    //     } else {
-    //         None
-    //     }
-    // }
-    // /// Set tab prompt dialog.
-    // pub fn set_prompt(&mut self, tab_id: WebViewId, prompt: PromptDialog) {
-    //     if let Some(tab) = self.tab_map.get_mut(&tab_id) {
-    //         self.prompt_tab_map.insert(prompt.id(), tab_id);
-    //         tab.set_prompt(prompt);
-    //     }
-    // }
-    // /// Remove prompt by tab webview ID.
-    // pub fn remove_prompt_by_tab_id(&mut self, tab_id: WebViewId) -> Option<PromptDialog> {
-    //     if let Some(tab) = self.tab_map.get_mut(&tab_id) {
-    //         if let Some(prompt) = tab.remove_prompt() {
-    //             self.prompt_tab_map.remove(&prompt.id());
-    //             return Some(prompt);
-    //         }
-    //     }
-    //     None
-    // }
-    // /// Remove prompt by prompt webview ID.
-    // pub fn remove_prompt_by_prompt_id(&mut self, prompt_id: WebViewId) -> Option<PromptDialog> {
-    //     if let Some(tab_id) = self.prompt_tab_map.remove(&prompt_id) {
-    //         self.remove_prompt_by_tab_id(tab_id)
-    //     } else {
-    //         None
-    //     }
-    // }
-    // /// Check if there is a prompt dialog by prompt webview ID.
-    // pub fn has_prompt(&self, prompt_id: WebViewId) -> bool {
-    //     self.prompt_tab_map.contains_key(&prompt_id)
-    // }
-}
+    /// Record the session history of a tab.
+    pub fn set_history(&mut self, tab_id: WebViewId, history: Vec<Url>, index: usize) {
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.history = history;
+            tab.history_index = index;
+        }
+    }
 
-impl Default for TabManager {
-    fn default() -> Self {
-        Self::new()
+    fn index_of(&self, id: WebViewId) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id() == id)
     }
 }
 
-/// Tab manager errors.
-pub enum TabManagerErr {
-    /// Index out of bounds.
-    IndexOutOfBounds,
-    /// WebView WebViewId not found.
-    WebViewIdNotFound,
-    /// Remove last WebView.
-    RemoveLastWebView,
-}
-
-/// Response to UI that the tab was created.
-#[derive(Debug, Clone, Serialize)]
-pub struct TabCreateResponse {
-    /// Tab creation success
-    pub success: bool,
-    /// Tab WebView id
-    pub id: WebViewId,
-}
-
-impl TabCreateResponse {
-    /// Create a new TabCreatedResult json string.
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
+/// Index of the active tab after the tab at `closed` is removed from a strip whose active tab was
+/// at `active`. `remaining` is the number of tabs left. This mirrors `panel.html`, which picks the
+/// tab that slides into the closed tab's place, or the previous one when the last tab closes.
+pub fn next_active_index(closed: usize, active: usize, remaining: usize) -> Option<usize> {
+    if remaining == 0 {
+        return None;
     }
-}
-
-/// Activate the tab request from UI.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TabActivateRequest {
-    /// Tab WebView id
-    pub id: WebViewId,
-}
-
-/// Activate the tab request from UI.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TabCloseRequest {
-    /// Tab WebView id
-    pub id: WebViewId,
+    Some(if closed < active {
+        active - 1
+    } else if closed == active {
+        closed.min(remaining - 1)
+    } else {
+        active
+    })
 }

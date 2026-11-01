@@ -12,19 +12,20 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use serde::{Deserialize, Serialize};
 use servo::{
     AllowOrDenyRequest, AuthenticationRequest, Cursor, DeviceIndependentPixel, DeviceIntRect,
-    DevicePixel, DevicePoint, DeviceVector2D, EmbedderControl, EmbedderControlId, FilePicker,
+    DevicePixel, DevicePoint, EmbedderControl, EmbedderControlId, FilePicker,
     InputEvent, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
     MouseLeftViewportEvent, MouseMoveEvent, NavigationRequest, Notification,
-    OffscreenRenderingContext, PermissionRequest, RenderingContext, Scroll, SimpleDialog,
-    WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WebViewId, WindowRenderingContext,
+    OffscreenRenderingContext, PermissionRequest, PromptDialog, RenderingContext, SimpleDialog,
+    WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WebViewId, WheelDelta, WheelEvent,
+    WheelMode, WindowRenderingContext,
 };
 use versoview_messages::ToControllerMessage;
 #[cfg(any(linux, target_os = "windows"))]
 use winit::window::ResizeDirection;
 use winit::{
-    dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
+    dpi::{LogicalPosition, PhysicalPosition, PhysicalSize},
     event::{ElementState, WindowEvent},
-    event_loop::ActiveEventLoop,
+    event_loop::{ActiveEventLoop, EventLoopProxy},
     keyboard::ModifiersState,
     window::{CursorIcon, Window as WinitWindow, WindowAttributes, WindowId},
 };
@@ -33,8 +34,10 @@ use crate::{
     Verso,
     keyboard::keyboard_event_from_winit,
     tab::TabManager,
+    verso::{DownloadCheckFollowUp, EventLoopProxyMessage},
     webview::{
         Panel,
+        history_menu::OpenHistoryMenuRequest,
         prompt::{PROMPT_LOGICAL_SIZE, PendingPrompt, Prompt},
     },
 };
@@ -117,8 +120,8 @@ pub struct Window {
     hovering_webview: Option<WebViewId>,
     /// Modifiers state of the keyboard.
     modifiers_state: Cell<ModifiersState>,
-    /// State to indicate if the window is resizing.
-    pub(crate) resizing: bool,
+    /// Proxy to ask the event loop to close this window or open another one.
+    proxy: EventLoopProxy<EventLoopProxyMessage>,
     /// Global menu event receiver for muda crate
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(crate) menu_event_receiver: MenuEventReceiver,
@@ -212,11 +215,20 @@ impl WebViewDelegate for WindowWebViewDelegate {
     }
 
     fn notify_closed(&self, webview: WebView) {
-        self.with_window(|window, _| window.close_tab(webview.id()));
+        self.with_window(|window, _| window.close_tab(webview.id(), false));
     }
 
-    fn notify_history_changed(&self, webview: WebView, _entries: Vec<url::Url>, _current: usize) {
-        self.with_window(|window, _| window.update_navbar(webview.id()));
+    fn notify_history_changed(&self, webview: WebView, entries: Vec<url::Url>, current: usize) {
+        self.with_window(|window, _| {
+            window
+                .tab_manager
+                .set_history(webview.id(), entries, current);
+            window.update_navbar(webview.id());
+        });
+    }
+
+    fn show_notification(&self, _webview: WebView, notification: Notification) {
+        self.with_window(|window, _| window.show_notification(&notification));
     }
 
     fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
@@ -228,10 +240,9 @@ impl WebViewDelegate for WindowWebViewDelegate {
     }
 
     fn request_navigation(&self, _webview: WebView, request: NavigationRequest) {
-        let request = self.with_window(|window, verso| {
-            window.defer_navigation_to_controller(verso, request)
-        });
-        // Allow when there is no window or no controller listening.
+        let request =
+            self.with_window(|window, verso| window.handle_navigation_request(verso, request));
+        // Allow when there is no window, no controller listening, and no download check.
         if let Some(Some(request)) = request {
             request.allow();
         }
@@ -259,6 +270,20 @@ impl WebViewDelegate for WindowWebViewDelegate {
     }
 
     fn show_embedder_control(&self, webview: WebView, control: EmbedderControl) {
+        // Verso's own pages (`verso://`) talk to Verso through `window.prompt("VERSO::...")`.
+        // Pages from the web must not reach that channel.
+        let control = match control {
+            EmbedderControl::SimpleDialog(SimpleDialog::Prompt(dialog))
+                if dialog.message().starts_with("VERSO::")
+                    && webview.url().is_some_and(|url| url.scheme() == "verso") =>
+            {
+                self.with_window(|window, verso| {
+                    window.handle_verso_page_prompt(verso, webview.id(), dialog)
+                });
+                return;
+            },
+            other => other,
+        };
         self.with_window(|window, verso| {
             window.present_embedder_control(verso, webview.id(), control)
         });
@@ -289,6 +314,11 @@ impl WebViewDelegate for PanelWebViewDelegate {
         if status == LoadStatus::Complete {
             self.0.with_window(|window, verso| window.finish_panel_load(verso));
         }
+    }
+
+    /// The panel's close button calls `window.close()`.
+    fn notify_closed(&self, _webview: WebView) {
+        self.0.with_window(|window, _| window.request_close());
     }
 
     fn show_embedder_control(&self, webview: WebView, control: EmbedderControl) {
@@ -355,7 +385,11 @@ impl WebViewDelegate for PromptWebViewDelegate {
 
 impl Window {
     /// Create a Verso window from Winit window and return the rendering context.
-    pub fn new(event_loop: &ActiveEventLoop, window_attributes: WindowAttributes) -> Self {
+    pub fn new(
+        event_loop: &ActiveEventLoop,
+        window_attributes: WindowAttributes,
+        proxy: EventLoopProxy<EventLoopProxyMessage>,
+    ) -> Self {
         let display_handle = event_loop
             .display_handle()
             .expect("Failed to get display handle");
@@ -369,11 +403,12 @@ impl Window {
         );
 
         // Setup for GL accelerated media handling. This is only active on certain Linux platforms
-        // and Windows.
-        {
+        // and Windows. Servo expects it once, before the first `WebView`, so later windows skip it.
+        static SETUP_GL_ACCELERATED_MEDIA: std::sync::Once = std::sync::Once::new();
+        SETUP_GL_ACCELERATED_MEDIA.call_once(|| {
             let details = rendering_context.surfman_details();
             crate::accelerated_gl_media::setup_gl_accelerated_media(details.0, details.1);
-        }
+        });
 
         let _ = rendering_context.make_current();
 
@@ -407,34 +442,13 @@ impl Window {
             mouse_position: Default::default(),
             hovering_webview: None,
             modifiers_state: Cell::new(ModifiersState::default()),
-            resizing: false,
+            proxy,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             menu_event_receiver: MenuEvent::receiver().clone(),
             tab_manager: TabManager::new(),
             focused_webview_id: None,
             show_bookmark: false,
         }
-    }
-
-    /// Get the content area size for the webview to draw on
-    pub fn get_content_size(
-        &self,
-        mut size: dpi::PhysicalSize<u32>,
-        include_tab: bool,
-        include_bookmark: bool,
-    ) -> dpi::PhysicalSize<u32> {
-        if self.panel.is_some() {
-            let mut height: f64 = PANEL_HEIGHT + PANEL_PADDING;
-            if include_tab {
-                height += TAB_HEIGHT;
-            }
-            if include_bookmark {
-                height += BOOKMARK_HEIGHT;
-            }
-            height *= self.scale_factor();
-            size.height -= height as u32
-        }
-        size
     }
 
     /// Create the panel webview and load the panel UI.
@@ -509,37 +523,57 @@ impl Window {
         self.mark_region_dirty(Region::Content);
     }
 
-    /// Close a tab
-    pub fn close_tab(&mut self, tab_id: WebViewId) {
+    /// Close a tab. `from_panel` is true when the panel already removed the tab from its strip.
+    ///
+    /// The tab strip and [`TabManager`] pick the same neighbour when the active tab closes, so
+    /// neither side has to wait for the other. Closing the last tab closes the window.
+    pub fn close_tab(&mut self, tab_id: WebViewId, from_panel: bool) {
+        if self.tab_manager.tab(tab_id).is_none() {
+            return;
+        }
         if self.prompt.as_ref().is_some_and(|prompt| prompt.parent == tab_id) {
             self.close_prompt();
         }
         let panel_tab_id = self.panel_tab_ids.remove(&tab_id);
-        // if there are more than 2 tabs, we need to ask for the new active tab after tab is closed
-        if self.tab_manager.count() > 1
+        if !from_panel
             && let Some(panel) = &self.panel
             && let Some(panel_tab_id) = panel_tab_id
         {
-            let cmd: String = format!(
-                "const nextTab = window.navbar.closeTab('{}');",
-                panel_tab_id.to_json()
+            panel.webview.evaluate_javascript(
+                format!("window.navbar.closeTab('{}')", panel_tab_id.to_json()),
+                |_| {},
             );
-            let activate_next_tab = r#"if (nextTab) window.prompt(`ACTIVATE_TAB:${JSON.stringify({ id: nextTab })}`)"#;
-
-            panel
-                .webview
-                .evaluate_javascript(format!("{cmd}{activate_next_tab}"), |_| {});
         }
-        let _ = self.tab_manager.close_tab(tab_id);
+        let previous = self.tab_manager.current_tab_id();
+        if self.focused_webview_id == Some(tab_id) {
+            self.focused_webview_id = None;
+        }
+        // Dropping the tab drops its `WebView`, which closes it in Servo.
+        drop(self.tab_manager.close_tab(tab_id));
+        if self.tab_manager.count() == 0 {
+            self.request_close();
+            return;
+        }
         if let Some(next) = self.tab_manager.current_tab_id()
+            && previous != Some(next)
             && let Some(tab) = self.tab_manager.tab(next)
         {
             tab.webview().show();
-            tab.webview().set_focused(true);
-            self.focused_webview_id = Some(next);
+            self.focus_webview(next);
+            self.update_navbar(next);
         }
         self.resize_webviews();
         self.mark_region_dirty(Region::Content);
+    }
+
+    /// Ask the event loop to close this window. The controller may handle the request instead.
+    pub(crate) fn request_close(&self) {
+        if let Err(error) = self
+            .proxy
+            .send_event(EventLoopProxyMessage::CloseWindow(self.id()))
+        {
+            log::error!("Failed to request closing window {:?}: {error}", self.id());
+        }
     }
 
     /// Activate a tab
@@ -585,7 +619,7 @@ impl Window {
         self.content_context = None;
     }
 
-    /// Handle Winit window event and return a boolean to indicate if the compositor should repaint immediately.
+    /// Handle a Winit window event for this window.
     pub fn handle_winit_window_event(
         &mut self,
         verso: &Rc<Verso>,
@@ -596,9 +630,6 @@ impl Window {
                 self.repaint();
             },
             WindowEvent::Resized(size) => {
-                if self.window.has_focus() {
-                    self.resizing = true;
-                }
                 let size = PhysicalSize::new(size.width.max(1), size.height.max(1));
                 self.rendering_context.resize(size);
                 self.resize_webviews();
@@ -702,16 +733,20 @@ impl Window {
                     log::trace!("Mouse position is None, skipping MouseWheel event.");
                     return;
                 };
-                const LINE_HEIGHT: f32 = 38.0;
-                let (mut dx, mut dy) = match delta {
+                // Pixels per line, in CSS pixels.
+                const LINE_HEIGHT: f64 = 38.0;
+                // Servo fires a DOM `wheel` event with this delta and, unless the page cancels
+                // it, scrolls by the inverse of the delta in device pixels.
+                let (mut dx, mut dy, mode) = match delta {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                        (*x as f64, (*y * LINE_HEIGHT) as f64)
+                        let line = LINE_HEIGHT * self.scale_factor();
+                        (*x as f64 * line, *y as f64 * line, WheelMode::DeltaLine)
                     },
                     winit::event::MouseScrollDelta::PixelDelta(position) => {
-                        let position = position.to_logical::<f64>(self.window.scale_factor());
-                        (position.x, position.y)
+                        (position.x, position.y, WheelMode::DeltaPixel)
                     },
                 };
+                // Scroll one axis at a time.
                 if dy.abs() >= dx.abs() {
                     dx = 0.0;
                 } else {
@@ -719,8 +754,15 @@ impl Window {
                 }
                 let point = DevicePoint::new(position.x as f32, position.y as f32);
                 if let Some((webview, local)) = self.hit_test(point) {
-                    let scroll = Scroll::Delta(DeviceVector2D::new(dx as f32, dy as f32).into());
-                    webview.notify_scroll_event(scroll, local.into());
+                    webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
+                        WheelDelta {
+                            x: dx,
+                            y: dy,
+                            z: 0.0,
+                            mode,
+                        },
+                        local.into(),
+                    )));
                 }
             },
             WindowEvent::ModifiersChanged(modifier) => self.modifiers_state.set(modifier.state()),
@@ -762,7 +804,7 @@ impl Window {
                 },
                 (modifiers, Code::KeyW) if modifiers == control_or_meta => {
                     if let Some(tab_id) = self.tab_manager.current_tab_id() {
-                        self.close_tab(tab_id);
+                        self.close_tab(tab_id, false);
                     }
                     return true;
                 },
@@ -1071,17 +1113,26 @@ impl Window {
         panel.webview.evaluate_javascript(script, |_| {});
     }
 
-    /// Send a navigation to the controller when it listens for them. Returns the request back
-    /// when it should be allowed right away.
-    fn defer_navigation_to_controller(
+    /// Decide a navigation request. The controller decides when it listens for navigations. In
+    /// the browser with a panel, Verso first checks whether the URL is a download. Returns the
+    /// request back when it should be allowed right away.
+    fn handle_navigation_request(
         &mut self,
         verso: &Rc<Verso>,
         request: NavigationRequest,
     ) -> Option<NavigationRequest> {
-        if !self.event_listeners.on_navigation_starting {
-            return Some(request);
-        }
-        let Some(sender) = verso.controller_sender() else {
+        let controller = verso
+            .controller_sender()
+            .filter(|_| self.event_listeners.on_navigation_starting);
+        let Some(sender) = controller else {
+            if self.panel.is_some() && is_http(&request.url) {
+                let id = uuid::Uuid::new_v4();
+                verso.check_download(request.url.clone(), DownloadCheckFollowUp::Navigation(id));
+                self.event_listeners
+                    .pending_navigations
+                    .insert(id, request);
+                return None;
+            }
             return Some(request);
         };
         let id = uuid::Uuid::new_v4();
@@ -1098,17 +1149,94 @@ impl Window {
         None
     }
 
-    /// Answer a navigation request that was sent to the controller.
-    pub(crate) fn answer_navigation(&mut self, id: &[u8], allow: bool) {
-        let Ok(id) = uuid::Uuid::from_slice(id) else {
-            log::error!("Controller answered an unknown navigation id");
-            return;
-        };
+    /// Answer a navigation request held for the controller or for a download check.
+    pub(crate) fn answer_navigation(&mut self, id: uuid::Uuid, allow: bool) {
         match self.event_listeners.pending_navigations.remove(&id) {
             Some(request) if allow => request.allow(),
             Some(request) => request.deny(),
-            None => log::warn!("No pending navigation for controller response {id}"),
+            None => log::warn!("No pending navigation for response {id}"),
         }
+    }
+
+    /// Continue after [`Verso::check_download`]. `proceed` is false when the URL turned out to
+    /// be a download, which then runs instead of the navigation.
+    pub(crate) fn finish_download_check(
+        &mut self,
+        follow_up: &DownloadCheckFollowUp,
+        url: &url::Url,
+        proceed: bool,
+    ) {
+        match follow_up {
+            DownloadCheckFollowUp::Navigation(id) => {
+                if self.event_listeners.pending_navigations.contains_key(id) {
+                    self.answer_navigation(*id, proceed);
+                }
+            },
+            DownloadCheckFollowUp::Load(tab_id) => {
+                if proceed && let Some(tab) = self.tab_manager.tab(*tab_id) {
+                    tab.webview().load(url.clone());
+                }
+            },
+        }
+    }
+
+    /// Show the panel's download button once a download exists.
+    pub(crate) fn show_download_button(&self) {
+        if let Some(panel) = &self.panel {
+            panel
+                .webview
+                .evaluate_javascript("window.navbar.showDownloadBtn(true)", |_| {});
+        }
+    }
+
+    /// Show the bookmark bar when there are bookmarks, and resize the regions when it changes.
+    fn update_bookmark_bar(&mut self, verso: &Rc<Verso>) {
+        let show = verso.has_bookmarks();
+        if show != self.show_bookmark {
+            self.show_bookmark = show;
+            self.resize_webviews();
+            self.mark_region_dirty(Region::Panel);
+            self.mark_region_dirty(Region::Content);
+        }
+    }
+
+    /// Answer a `window.prompt("VERSO::...")` from Verso's bookmark and downloads pages.
+    fn handle_verso_page_prompt(
+        &mut self,
+        verso: &Rc<Verso>,
+        tab_id: WebViewId,
+        mut dialog: PromptDialog,
+    ) {
+        let message = dialog.message().trim_start_matches("VERSO::").to_owned();
+        if message == "DOWNLOAD_STATUS_GET" {
+            dialog.set_current_value(&verso.downloads_json());
+            dialog.confirm();
+            return;
+        }
+        if message == "BOOKMARK_LIST_GET" {
+            dialog.set_current_value(&verso.bookmarks_json());
+            dialog.confirm();
+            return;
+        }
+        if let Some(id) = message.strip_prefix("ABORT_DOWNLOAD::") {
+            verso.abort_download(id);
+        } else if let Some(id) = message.strip_prefix("BOOKMARK_REMOVE::") {
+            verso.remove_bookmark(id);
+        } else if let Some(params) = message.strip_prefix("BOOKMARK_RENAME::") {
+            match params.split("::").collect::<Vec<_>>()[..] {
+                [id, name] => verso.rename_bookmark(id, name.to_owned()),
+                _ => log::error!("Invalid parameters for BOOKMARK_RENAME"),
+            }
+        } else if let Some(url) = message.strip_prefix("NAVIGATE_TO::") {
+            if let Some(url) = parse_navigation_url(url)
+                && let Some(tab) = self.tab_manager.tab(tab_id)
+            {
+                tab.webview().load(url);
+            }
+        } else {
+            log::debug!("Ignoring Verso page prompt: {message}");
+        }
+        dialog.dismiss();
     }
 
     fn present_panel_control(
@@ -1118,9 +1246,11 @@ impl Window {
         control: EmbedderControl,
     ) {
         match control {
-            EmbedderControl::SimpleDialog(SimpleDialog::Prompt(dialog)) => {
+            EmbedderControl::SimpleDialog(SimpleDialog::Prompt(mut dialog)) => {
                 let message = dialog.message().to_owned();
-                self.handle_panel_prompt(verso, &message);
+                if let Some(value) = self.handle_panel_prompt(verso, &message) {
+                    dialog.set_current_value(&value);
+                }
                 dialog.confirm();
             },
             EmbedderControl::SimpleDialog(dialog) => dialog.confirm(),
@@ -1246,7 +1376,9 @@ impl Window {
         self.mark_region_dirty(Region::Content);
     }
 
-    fn handle_panel_prompt(&mut self, verso: &Rc<Verso>, message: &str) {
+    /// Handle a `window.prompt(...)` command from the panel. Returns the value the panel reads
+    /// back, for the commands that have one.
+    fn handle_panel_prompt(&mut self, verso: &Rc<Verso>, message: &str) -> Option<String> {
         let current = self
             .tab_manager
             .current_tab()
@@ -1270,31 +1402,75 @@ impl Window {
             "MINIMIZE" => {
                 let _ = self.window.set_minimized(true);
             },
-            "MAXIMIZE" => self.window.set_maximized(!self.window.is_maximized()),
+            "MAXIMIZE" | "DBCLICK_PANEL" => self.window.set_maximized(!self.window.is_maximized()),
+            "DRAG_WINDOW" => {
+                if let Err(error) = self.window.drag_window() {
+                    log::warn!("Failed to drag the window: {error}");
+                }
+            },
+            "NEW_WINDOW" => {
+                if let Err(error) = self.proxy.send_event(EventLoopProxyMessage::NewWindow) {
+                    log::error!("Failed to request a new window: {error}");
+                }
+            },
+            "BOOKMARK" => {
+                let tab = self.tab_manager.current_tab()?;
+                let url = tab.webview().url()?;
+                // Verso's own pages are not bookmarked.
+                if url.scheme() != "verso" {
+                    verso.toggle_bookmark(tab.title(), url.to_string());
+                }
+                self.update_bookmark_bar(verso);
+                return Some(verso.bookmarks_json());
+            },
+            "UPDATE_BOOKMARK" => {
+                self.update_bookmark_bar(verso);
+                return Some(verso.bookmarks_json());
+            },
+            "OPEN_BOOKMARK_MANAGER" => self.create_tab(
+                verso,
+                url::Url::parse("verso://resources/components/bookmark.html").unwrap(),
+            ),
+            "DOWNLOAD" => self.create_tab(
+                verso,
+                url::Url::parse("verso://resources/components/downloads.html").unwrap(),
+            ),
             other if other.starts_with("NAVIGATE_TO:") => {
-                let url = other.trim_start_matches("NAVIGATE_TO:");
-                let Ok(url) = url::Url::parse(url) else {
-                    log::warn!("Panel navigation URL is invalid: {url}");
-                    return;
-                };
-                if let Some(webview) = current {
-                    webview.load(url);
-                } else {
-                    self.create_tab(verso, url);
+                let url = parse_navigation_url(other.trim_start_matches("NAVIGATE_TO:"))?;
+                match self.tab_manager.current_tab_id() {
+                    Some(tab_id) if is_http(&url) => {
+                        verso.check_download(url, DownloadCheckFollowUp::Load(tab_id));
+                    },
+                    Some(_) => current?.load(url),
+                    None => self.create_tab(verso, url),
                 }
             },
             other if other.starts_with("ACTIVATE_TAB:") => {
                 let payload = other.trim_start_matches("ACTIVATE_TAB:");
-                if let Some(tab_id) = self.parse_activate_tab(payload) {
+                if let Some(tab_id) = self.parse_panel_tab(payload) {
                     self.activate_tab(tab_id, self.tab_manager.count() > 1);
+                }
+            },
+            other if other.starts_with("CLOSE_TAB:") => {
+                let payload = other.trim_start_matches("CLOSE_TAB:");
+                if let Some(tab_id) = self.parse_panel_tab(payload) {
+                    self.close_tab(tab_id, true);
+                }
+            },
+            other if other.starts_with("OPEN_HISTORY_MENU:") => {
+                let payload = other.trim_start_matches("OPEN_HISTORY_MENU:");
+                match serde_json::from_str::<OpenHistoryMenuRequest>(payload) {
+                    Ok(request) => self.show_history_menu(request),
+                    Err(error) => log::error!("Invalid history menu request {payload:?}: {error}"),
                 }
             },
             _ => log::debug!("Ignoring panel prompt: {message}"),
         }
+        None
     }
 
-    /// Read the tab id from an `ACTIVATE_TAB:{"id": ...}` panel message.
-    fn parse_activate_tab(&self, payload: &str) -> Option<WebViewId> {
+    /// Read the tab id from an `ACTIVATE_TAB:` or `CLOSE_TAB:` panel message, `{"id": ...}`.
+    fn parse_panel_tab(&self, payload: &str) -> Option<WebViewId> {
         let value: serde_json::Value = serde_json::from_str(payload).ok()?;
         let id = &value["id"];
         let panel_tab_id: PanelTabId = serde_json::from_value(id.clone()).ok().or_else(|| {
@@ -1305,11 +1481,6 @@ impl Window {
             .iter()
             .find(|(_, id)| **id == panel_tab_id)
             .map(|(webview_id, _)| *webview_id)
-    }
-
-    /// True when a webview in this window is producing animation frames.
-    pub(crate) fn is_animating(&self) -> bool {
-        self.all_webviews().iter().any(|webview| webview.animating())
     }
 
     /// Queues a Winit `WindowEvent::RedrawRequested` event to be emitted that aligns with the windowing system drawing loop.
@@ -1390,13 +1561,13 @@ impl Window {
     }
 
     /// This method enables IME and set the IME cursor area of the window.
-    /// The position is in logical position so it'll scale according to screen scaling factor.
+    /// `position` is in the webview's device pixels.
     pub fn show_ime(&self, webview_id: WebViewId, position: DeviceIntRect) {
         self.window.set_ime_allowed(true);
         let origin = self.webview_origin(webview_id);
         self.window.set_ime_cursor_area(
-            LogicalPosition::new(position.min.x + origin.x, position.min.y + origin.y),
-            LogicalSize::new(position.width(), position.height()),
+            PhysicalPosition::new(position.min.x + origin.x, position.min.y + origin.y),
+            PhysicalSize::new(position.width(), position.height()),
         );
     }
 
@@ -1422,14 +1593,6 @@ impl Window {
         #[cfg(not(linux))]
         let _ = display_notification.show();
     }
-
-    // /// Close window's webview menu
-    // pub(crate) fn close_webview_menu(&mut self, sender: &Sender<EmbedderToConstellationMessage>) {
-    //     if let Some(menu) = self.webview_menu.as_mut() {
-    //         menu.close(sender);
-    //     }
-    // }
-
 }
 
 // Non-decorated window resizing for Windows and Linux.
@@ -1576,4 +1739,23 @@ fn present_file_picker(mut picker: FilePicker) {
     } else {
         picker.dismiss();
     }
+}
+
+/// Parse a URL typed in the panel. A bare host such as `example.com` becomes `https://example.com`.
+fn parse_navigation_url(text: &str) -> Option<url::Url> {
+    match url::Url::parse(text) {
+        Ok(url) => Some(url),
+        Err(url::ParseError::RelativeUrlWithoutBase) => url::Url::parse(&format!("https://{text}"))
+            .inspect_err(|error| log::warn!("Navigation URL {text:?} is invalid: {error}"))
+            .ok(),
+        Err(error) => {
+            log::warn!("Navigation URL {text:?} is invalid: {error}");
+            None
+        },
+    }
+}
+
+/// Only HTTP(S) responses can be downloads; other schemes load directly.
+fn is_http(url: &url::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
 }
