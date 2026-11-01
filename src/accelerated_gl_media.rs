@@ -6,10 +6,9 @@ use std::cell::RefMut;
 
 use surfman::{Context, Device};
 
-#[cfg(not(any(
-    target_os = "windows",
-    all(target_os = "linux", not(target_env = "ohos"))
-)))]
+// Servo's media context is EGL or GLX only. Windows surfman is WGL, so there is
+// nothing to hand over. macOS is CGL and is skipped for the same reason.
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 pub(crate) fn setup_gl_accelerated_media(_: RefMut<'_, Device>, _: RefMut<'_, Context>) {}
 
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
@@ -23,7 +22,7 @@ pub(crate) fn setup_gl_accelerated_media(device: RefMut<'_, Device>, context: Re
     let media_context = match (&*device, &*context) {
         (Device::Default(Device::Default(device)), Context::Default(Context::Default(context))) => {
             MediaGlContext::Egl(device.native_context(context).egl_context as usize)
-        },
+        }
         (
             Device::Default(Device::Alternate(device)),
             Context::Default(Context::Alternate(context)),
@@ -34,30 +33,17 @@ pub(crate) fn setup_gl_accelerated_media(device: RefMut<'_, Device>, context: Re
     let media_display = match device.connection() {
         Connection::Default(Connection::Default(connection)) => {
             MediaNativeDisplay::Egl(connection.native_connection().0 as usize)
-        },
+        }
         Connection::Default(Connection::Alternate(connection)) => {
             MediaNativeDisplay::X11(connection.native_connection().x11_display as usize)
-        },
+        }
         _ => MediaNativeDisplay::Unknown,
     };
 
     Servo::initialize_gl_accelerated_media(media_display, api, media_context);
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) fn setup_gl_accelerated_media(device: RefMut<'_, Device>, context: RefMut<'_, Context>) {
-    use servo::{MediaGlContext, MediaNativeDisplay, Servo};
-
-    let api = api(&device, &context);
-    let context = MediaGlContext::Egl(device.native_context(&context).egl_context as usize);
-    let display = MediaNativeDisplay::Egl(device.native_device().egl_display as usize);
-    Servo::initialize_gl_accelerated_media(display, api, context);
-}
-
-#[cfg(any(
-    all(target_os = "linux", not(target_env = "ohos")),
-    target_os = "windows"
-))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn api(device: &RefMut<Device>, context: &RefMut<Context>) -> servo::MediaGlApi {
     use servo::MediaGlApi;
     use surfman::GLApi;

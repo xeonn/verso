@@ -22,7 +22,7 @@ use versoview_messages::ToControllerMessage;
 #[cfg(any(linux, target_os = "windows"))]
 use winit::window::ResizeDirection;
 use winit::{
-    dpi::{LogicalPosition, PhysicalPosition, PhysicalSize},
+    dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoopProxy},
     keyboard::ModifiersState,
@@ -411,8 +411,8 @@ impl Window {
                 .expect("Could not create RenderingContext for window."),
         );
 
-        // Setup for GL accelerated media handling. This is only active on certain Linux platforms
-        // and Windows. Servo expects it once, before the first `WebView`, so later windows skip it.
+        // Setup for GL accelerated media handling. Servo only accepts this on desktop Linux.
+        // It must run once, before the first `WebView`, so later windows skip it.
         static SETUP_GL_ACCELERATED_MEDIA: std::sync::Once = std::sync::Once::new();
         SETUP_GL_ACCELERATED_MEDIA.call_once(|| {
             let details = rendering_context.surfman_details();
@@ -1768,6 +1768,8 @@ impl Window {
 use objc2::runtime::AnyObject;
 #[cfg(macos)]
 use raw_window_handle::{AppKitWindowHandle, RawWindowHandle};
+#[cfg(macos)]
+use winit::dpi::LogicalPosition;
 
 /// Window decoration for macOS.
 #[cfg(macos)]
