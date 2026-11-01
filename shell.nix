@@ -40,7 +40,7 @@ stdenv.mkDerivation {
     wayland
     openssl
     nixgl.auto.nixGLDefault
-    (python3.withPackages (ps: with ps; [pip dbus mako]))
+    (python3.withPackages (ps: with ps; [pip dbus]))
   ];
   LD_LIBRARY_PATH = lib.makeLibraryPath [
     zlib

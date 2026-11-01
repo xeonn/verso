@@ -14,10 +14,10 @@ use net_traits::{
     response::{Response, ResponseBody},
 };
 use servo_config::{
-    opts::{Opts, OutputOptions, set_options},
+    opts::{Opts, OutputOptions},
     prefs::Preferences,
 };
-use versoview_messages::{ConfigFromController, UserScript};
+use versoview_messages::{ConfigFromController, CustomProtocol, UserScript};
 use winit::window::{Fullscreen, WindowAttributes};
 
 /// Servo time profile settings
@@ -47,6 +47,8 @@ pub struct CliArgs {
     pub no_maximized: bool,
     /// Port number to start a server to listen to remote Firefox devtools connections. 0 for random port.
     pub devtools_port: Option<u16>,
+    /// Start remote WebDriver server on port
+    pub webdriver_port: Option<u16>,
     /// Servo time profile settings
     pub profiler_settings: Option<versoview_messages::ProfilerSettings>,
     /// Path to resource directory. If None, Verso will try to get default directory. And if that
@@ -81,6 +83,12 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
         "devtools-port",
         "Launch Verso with devtools server enabled and listen to port",
         "1234",
+    );
+    opts.optopt(
+        "",
+        "webdriver-port",
+        "Start remote WebDriver server on port",
+        "7000",
     );
     opts.optopt(
         "p",
@@ -174,6 +182,12 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
         log::error!("Failed to parse devtools-port command line argument: {e}");
         None
     });
+    let webdriver_port = matches
+        .opt_get::<u16>("webdriver-port")
+        .unwrap_or_else(|e| {
+            log::error!("Failed to parse webdriver-port command line argument: {e}");
+            None
+        });
 
     let profiler_settings = if let Ok(Some(profiler_interval)) = matches.opt_get("profiler") {
         let profile_output = matches.opt_str("profiler-output-file");
@@ -249,6 +263,7 @@ pub fn parse_cli_args() -> Result<CliArgs, getopts::Fail> {
         ipc_channel,
         no_panel,
         devtools_port,
+        webdriver_port,
         profiler_settings,
         user_agent,
         init_script,
@@ -271,6 +286,8 @@ pub struct Config {
     pub window_attributes: WindowAttributes,
     /// Port number to start a server to listen to remote Firefox devtools connections. 0 for random port.
     pub devtools_port: Option<u16>,
+    /// Start remote WebDriver server on port
+    pub webdriver_port: Option<u16>,
     /// Servo time profile settings
     pub profiler_settings: Option<ProfilerSettings>,
     /// Override the user agent
@@ -282,6 +299,8 @@ pub struct Config {
     /// Path to resource directory. If None, Verso will try to get default directory. And if that
     /// still doesn't exist, all resource configuration will set to default values.
     pub resource_dir: PathBuf,
+    /// Register those custom protocols
+    pub custom_protocols: Vec<CustomProtocol>,
 }
 
 impl Config {
@@ -324,6 +343,7 @@ impl Config {
             .with_transparent(config.transparent)
             .with_decorations(config.decorated)
             .with_title(config.title.unwrap_or("Verso".to_owned()))
+            .with_theme(to_winit_theme(&config.theme))
             .with_window_icon(config.icon.and_then(|icon| {
                 winit::window::Icon::from_rgba(icon.rgba, icon.width, icon.height).ok()
             }));
@@ -347,6 +367,8 @@ impl Config {
         });
         window_attributes = window_attributes.with_visible(config.visible);
         window_attributes = window_attributes.with_active(config.focused);
+        window_attributes =
+            window_attributes.with_window_level(to_winit_window_level(config.window_level));
 
         let profiler_settings =
             config
@@ -370,6 +392,7 @@ impl Config {
             with_panel,
             window_attributes,
             devtools_port: config.devtools_port,
+            webdriver_port: config.webdriver_port,
             profiler_settings,
             user_agent,
             user_scripts: config
@@ -382,6 +405,7 @@ impl Config {
                 .collect(),
             zoom_level: config.zoom_level,
             resource_dir,
+            custom_protocols: config.custom_protocols,
         }
     }
 
@@ -389,12 +413,22 @@ impl Config {
     pub fn create_protocols(&self) -> ProtocolRegistry {
         let handler = ResourceReader(self.resource_dir.clone());
         let mut protocols = ProtocolRegistry::with_internal_protocols();
-        protocols.register("verso", handler);
+        protocols
+            .register("verso", handler)
+            .expect("Registering custom protocol `verso` should not fail");
+        for custom_protocol in &self.custom_protocols {
+            let scheme = &custom_protocol.scheme;
+            if let Err(error) =
+                protocols.register(scheme, CustomProtocolHandler(custom_protocol.clone()))
+            {
+                log::warn!("Registering custom protocol {scheme} failed: {error:?}");
+            }
+        }
         protocols
     }
 
     /// Init options and preferences.
-    pub fn init(&self) {
+    pub fn init(&self) -> (Opts, Preferences) {
         // Set the resource files of Servo.
         resources::set(Box::new(ResourceReader(self.resource_dir.clone())));
 
@@ -406,7 +440,7 @@ impl Config {
         }
 
         // Set the global options of Servo.
-        set_options(opts);
+        // initialize_options(opts);
 
         let (devtools_server_enabled, devtools_port) =
             if let Some(devtools_port) = self.devtools_port {
@@ -416,14 +450,17 @@ impl Config {
             };
 
         // Set the preferences of Servo.
-        servo_config::prefs::set(Preferences {
-            dom_svg_enabled: true, // Some pages fail to render if this is disabled
+        // servo_config::prefs::set(
+        let preference = Preferences {
             devtools_server_enabled,
             devtools_server_port: devtools_port as i64,
             dom_notification_enabled: true, // experimental feature
             user_agent: self.user_agent.clone(),
             ..Default::default()
-        });
+        };
+        // );
+
+        (opts, preference)
     }
 }
 
@@ -455,21 +492,20 @@ impl ResourceReaderMethods for ResourceReader {
             match resource {
                 // Rigppy image is the only one needs to be valid bytes.
                 // Others can be empty and Servo will set to default.
-                Resource::RippyPNG => &include_bytes!("../resources/rippy.png")[..],
-                #[cfg(feature = "embed-useragent-stylesheets")]
-                Resource::UserAgentCSS => &include_bytes!("../resources/user-agent.css")[..],
-                #[cfg(feature = "embed-useragent-stylesheets")]
-                Resource::ServoCSS => &include_bytes!("../resources/servo.css")[..],
-                #[cfg(feature = "embed-useragent-stylesheets")]
-                Resource::PresentationalHintsCSS => {
-                    &include_bytes!("../resources/presentational-hints.css")[..]
-                }
+                Resource::BrokenImageIcon => &include_bytes!("../resources/rippy.png")[..],
                 Resource::HstsPreloadList => {
                     log::warn!(
                         "HSTS preload list not found, falling back to an empty list, to set this, put the list at '{}'",
                         path.display()
                     );
-                    r###"{ "entries": [] }"###.as_bytes()
+                    // This is made out of
+                    //
+                    // ```
+                    // let mut wtr = std::io::BufWriter::new(std::fs::File::create("map.fst")?);
+                    // let mut build = fst::MapBuilder::new(wtr)?;
+                    // build.finish()?;
+                    // ```
+                    b"\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x12\x00\x00\x00\x00\x00\x00\x00Tk-\x0f"
                 }
                 _ => &[],
             }
@@ -529,6 +565,30 @@ impl ProtocolHandler for ResourceReader {
     }
 }
 
+struct CustomProtocolHandler(CustomProtocol);
+
+impl ProtocolHandler for CustomProtocolHandler {
+    #[allow(unused_variables)]
+    fn load(
+        &self,
+        request: &mut Request,
+        done_chan: &mut net::fetch::methods::DoneChannel,
+        context: &net::fetch::methods::FetchContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Response> + Send>> {
+        Box::pin(std::future::ready(Response::network_internal_error(
+            "This should be handled through `on_web_resource_requested` instead",
+        )))
+    }
+
+    fn is_fetchable(&self) -> bool {
+        self.0.fetchable
+    }
+
+    fn is_secure(&self) -> bool {
+        self.0.secure
+    }
+}
+
 /// Helper function to get default resource directory if it's not provided.
 fn resources_dir_path() -> PathBuf {
     #[cfg(feature = "packager")]
@@ -563,4 +623,26 @@ fn default_user_agent_string() -> &'static str {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Servo/1.0 Firefox/111.0";
 
     UA_STRING
+}
+
+pub(crate) fn to_winit_window_level(
+    window_level: versoview_messages::WindowLevel,
+) -> winit::window::WindowLevel {
+    match window_level {
+        versoview_messages::WindowLevel::Normal => winit::window::WindowLevel::Normal,
+        versoview_messages::WindowLevel::AlwaysOnTop => winit::window::WindowLevel::AlwaysOnTop,
+        versoview_messages::WindowLevel::AlwaysOnBottom => {
+            winit::window::WindowLevel::AlwaysOnBottom
+        }
+    }
+}
+
+pub(crate) fn to_winit_theme(
+    theme: &Option<versoview_messages::Theme>,
+) -> Option<winit::window::Theme> {
+    match theme {
+        Some(versoview_messages::Theme::Light) => Some(winit::window::Theme::Light),
+        Some(versoview_messages::Theme::Dark) => Some(winit::window::Theme::Dark),
+        None => None,
+    }
 }

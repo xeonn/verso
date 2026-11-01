@@ -1,6 +1,7 @@
+use crate::{CustomProtocol, ProfilerSettings, UserScript};
 use dpi::{Position, Size};
 use std::path::{Path, PathBuf};
-use versoview_messages::{ConfigFromController, ProfilerSettings, UserScript};
+use versoview_messages::ConfigFromController;
 
 use crate::VersoviewController;
 
@@ -12,12 +13,6 @@ impl VersoBuilder {
     /// Creates a new [`VersoBuilder`] with default settings.
     pub fn new() -> Self {
         Self(ConfigFromController::default())
-    }
-
-    /// Sets whether the control panel should be included.
-    pub fn with_panel(mut self, with_panel: bool) -> Self {
-        self.0.with_panel = with_panel;
-        self
     }
 
     /// Sets the initial window size.
@@ -75,14 +70,38 @@ impl VersoBuilder {
     }
 
     /// Sets the window icon.
-    pub fn icon(mut self, icon: versoview_messages::Icon) -> Self {
+    pub fn icon(mut self, icon: crate::Icon) -> Self {
         self.0.icon = Some(icon);
+        self
+    }
+
+    /// Sets the window level.
+    pub fn window_level(mut self, window_level: crate::WindowLevel) -> Self {
+        self.0.window_level = window_level;
+        self
+    }
+
+    /// Sets the prefered theme.
+    pub fn theme(mut self, theme: crate::Theme) -> Self {
+        self.0.theme = Some(theme);
+        self
+    }
+
+    /// Sets whether the control panel should be included.
+    pub fn with_panel(mut self, with_panel: bool) -> Self {
+        self.0.with_panel = with_panel;
         self
     }
 
     /// Port number to start a server to listen to remote Firefox devtools connections. 0 for random port.
     pub fn devtools_port(mut self, port: u16) -> Self {
         self.0.devtools_port = Some(port);
+        self
+    }
+
+    /// Start remote WebDriver server on port
+    pub fn webdriver_port(mut self, port: u16) -> Self {
+        self.0.webdriver_port = Some(port);
         self
     }
 
@@ -125,6 +144,40 @@ impl VersoBuilder {
     /// Sets the resource directory path.
     pub fn resources_directory(mut self, path: impl Into<PathBuf>) -> Self {
         self.0.resources_directory = Some(path.into());
+        self
+    }
+
+    /// Registers a custom protocol.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// let verso_builder =
+    ///     VersoBuilder::new().custom_protocol(CustomProtocolBuilder::new("custom-protocol-1"));
+    /// ```
+    pub fn custom_protocol(mut self, custom_protocol: impl Into<CustomProtocol>) -> Self {
+        self.0.custom_protocols.push(custom_protocol.into());
+        self
+    }
+
+    /// Registers multiple custom protocols.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// let verso_builder = VersoBuilder::new().custom_protocols([
+    ///     CustomProtocolBuilder::new("custom-protocol-1"),
+    ///     CustomProtocolBuilder::new("custom-protocol-2"),
+    /// ]);
+    /// ```
+    pub fn custom_protocols<I, C>(mut self, custom_protocols: I) -> Self
+    where
+        I: IntoIterator<Item = C>,
+        C: Into<CustomProtocol>,
+    {
+        for custom_protocol in custom_protocols {
+            self = self.custom_protocol(custom_protocol);
+        }
         self
     }
 

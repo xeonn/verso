@@ -25,8 +25,7 @@ Verso is still under development. We don't accept feature requests at the moment
 - Install [scoop](https://scoop.sh/) and then install other tools:
 
 ```sh
-scoop install git python llvm cmake curl
-pip install mako
+scoop install git python uv llvm cmake curl
 ```
 
 > You can also use chocolatey to install if you prefer it.
@@ -43,9 +42,7 @@ cargo run
 - Install [Homebrew](https://brew.sh/) and then install other tools:
 
 ```sh
-brew install cmake pkg-config harfbuzz python@3 # Install required dependencies CMake, pkg-config, HarfBuzz, and Python 3.
-pip3 install mako # Install the Mako templating engine
-curl https://sh.rustup.rs -sSf | sh # Install Rust and Cargo
+brew install cmake pkg-config harfbuzz uv
 ```
 
 - Build & run:

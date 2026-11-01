@@ -19,7 +19,7 @@ use std::{
     time::Instant,
 };
 
-const VERSO_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSO_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Decompress the archive to the output directory, this should resulting in a versoview(.exe) in that directory
 pub fn decompress_archive<P1: AsRef<Path>, P2: AsRef<Path>>(
@@ -96,7 +96,7 @@ pub fn default_output_directory() -> PathBuf {
         .to_path_buf()
 }
 
-/// Default archive base URL: https://github.com/versotile-org/versoview-release/releases
+/// Default archive base URL: <https://github.com/tauri-apps/verso/releases>
 pub const fn default_archive_base_url() -> &'static str {
-    "https://github.com/versotile-org/versoview-release/releases"
+    "https://github.com/tauri-apps/verso/releases"
 }

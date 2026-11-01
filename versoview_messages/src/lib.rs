@@ -13,7 +13,6 @@ type SerializedPipelineId = Vec<u8>;
 
 /// Message sent from the controller to versoview
 #[derive(Debug, Serialize, Deserialize)]
-#[non_exhaustive]
 pub enum ToVersoMessage {
     /// Initial configs for versoview
     /// this will be the first message sent to Verso once we received the sender from [`ToControllerMessage::SetToVersoSender`]
@@ -38,6 +37,8 @@ pub enum ToVersoMessage {
     ListenToWebResourceRequests,
     /// Response to a [`ToControllerMessage::OnWebResourceRequested`] message from versoview
     WebResourceRequestResponse(WebResourceRequestResponse),
+    /// Sets the window title
+    SetTitle(String),
     /// Sets the webview window's size
     SetSize(Size),
     /// Sets the webview window's position
@@ -50,10 +51,16 @@ pub enum ToVersoMessage {
     SetFullscreen(bool),
     /// Show or hide the window
     SetVisible(bool),
+    /// Show or hide the window
+    SetWindowLevel(WindowLevel),
+    /// Sets the theme
+    SetTheme(Option<Theme>),
     /// Moves the window with the left mouse button until the button is released
     StartDragging,
     /// Bring the window to the front, and capture input focus
     Focus,
+    /// Get the title of the window, need a response with [`ToControllerMessage::GetTitleResponse`]
+    GetTitle(uuid::Uuid),
     /// Get the window's size, need a response with [`ToControllerMessage::GetSizeResponse`]
     GetSize(uuid::Uuid, SizeType),
     /// Get the window's position, need a response with [`ToControllerMessage::GetPositionResponse`]
@@ -68,6 +75,8 @@ pub enum ToVersoMessage {
     GetVisible(uuid::Uuid),
     /// Get the scale factor of the window, need a response with [`ToControllerMessage::GetScaleFactorResponse`]
     GetScaleFactor(uuid::Uuid),
+    /// Get the current theme of the window, need a response with [`ToControllerMessage::GetThemeResponse`]
+    GetTheme(uuid::Uuid),
     /// Get the current URL of the webview, need a response with [`ToControllerMessage::GetCurrentUrlResponse`]
     GetCurrentUrl(uuid::Uuid),
 }
@@ -86,7 +95,6 @@ pub enum SizeType {
 
 /// Message sent from versoview to the controller
 #[derive(Debug, Serialize, Deserialize)]
-#[non_exhaustive]
 pub enum ToControllerMessage {
     /// IPC sender for the controller to send commands to versoview,
     /// this will be the first message sent to the controller once connected
@@ -95,6 +103,8 @@ pub enum ToControllerMessage {
     OnNavigationStarting(SerializedPipelineId, url::Url),
     /// Sent on a new web resource request, need a response with [`ToVersoMessage::WebResourceRequestResponse`]
     OnWebResourceRequested(WebResourceRequest),
+    /// Response to a [`ToVersoMessage::GetTitle`]
+    GetTitleResponse(uuid::Uuid, String),
     /// Response to a [`ToVersoMessage::GetSize`]
     GetSizeResponse(uuid::Uuid, PhysicalSize<u32>),
     /// Response to a [`ToVersoMessage::GetPosition`]
@@ -109,6 +119,8 @@ pub enum ToControllerMessage {
     GetVisibleResponse(uuid::Uuid, bool),
     /// Response to a [`ToVersoMessage::GetScaleFactor`]
     GetScaleFactorResponse(uuid::Uuid, f64),
+    /// Response to a [`ToVersoMessage::GetTheme`]
+    GetThemeResponse(uuid::Uuid, Theme),
     /// Response to a [`ToVersoMessage::GetCurrentUrl`]
     GetCurrentUrlResponse(uuid::Uuid, url::Url),
     /// Verso have recieved a close request from the OS
@@ -118,10 +130,6 @@ pub enum ToControllerMessage {
 /// Configuration of Verso instance.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConfigFromController {
-    /// URL to load initially.
-    pub url: Option<url::Url>,
-    /// Should launch without or without control panel
-    pub with_panel: bool,
     /// Window size for the initial winit window
     pub inner_size: Option<Size>,
     /// Window position for the initial winit window
@@ -142,8 +150,19 @@ pub struct ConfigFromController {
     pub title: Option<String>,
     /// Window icon of the initial winit window.
     pub icon: Option<Icon>,
+    /// The window level for the initial winit window
+    pub window_level: WindowLevel,
+    /// The prefered theme for the initial winit window
+    pub theme: Option<Theme>,
+
+    /// URL to load initially.
+    pub url: Option<url::Url>,
+    /// Should launch without or without control panel
+    pub with_panel: bool,
     /// Port number to start a server to listen to remote Firefox devtools connections. 0 for random port.
     pub devtools_port: Option<u16>,
+    /// Start remote WebDriver server on port
+    pub webdriver_port: Option<u16>,
     /// Servo time profile settings
     pub profiler_settings: Option<ProfilerSettings>,
     /// Override the user agent
@@ -155,29 +174,36 @@ pub struct ConfigFromController {
     /// Path to resource directory. If None, Verso will try to get default directory. And if that
     /// still doesn't exist, all resource configuration will set to default values.
     pub resources_directory: Option<PathBuf>,
+    /// Register those custom protocols
+    pub custom_protocols: Vec<CustomProtocol>,
 }
 
 impl Default for ConfigFromController {
     fn default() -> Self {
         Self {
-            url: None,
-            with_panel: false,
             inner_size: None,
             position: None,
             maximized: false,
             visible: true,
+            fullscreen: false,
             focused: true,
             decorated: false,
             transparent: true,
             title: None,
             icon: None,
-            fullscreen: false,
+            window_level: WindowLevel::Normal,
+            theme: None,
+
+            url: None,
+            with_panel: false,
             devtools_port: None,
+            webdriver_port: None,
             profiler_settings: None,
             user_agent: None,
             user_scripts: Vec::new(),
             zoom_level: None,
             resources_directory: None,
+            custom_protocols: Vec::new(),
         }
     }
 }
@@ -190,6 +216,34 @@ pub struct Icon {
     pub width: u32,
     /// Icon height.
     pub height: u32,
+}
+
+/// A window level groups windows with respect to their z-position.
+///
+/// The relative ordering between windows in different window levels is fixed.
+/// The z-order of a window within the same window level may change dynamically on user interaction.
+///
+/// ## Platform-specific
+///
+/// - **Wayland:** Unsupported.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub enum WindowLevel {
+    /// The default.
+    #[default]
+    Normal,
+    /// The window will always be on top of normal windows.
+    AlwaysOnTop,
+    /// The window will always be below normal windows.
+    ///
+    /// This is useful for a widget-based app.
+    AlwaysOnBottom,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+pub enum Theme {
+    #[default]
+    Light,
+    Dark,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -236,4 +290,44 @@ pub struct WebResourceRequestResponse {
     pub id: uuid::Uuid,
     #[serde(with = "http_serde_ext::response::option")]
     pub response: Option<http::Response<Vec<u8>>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CustomProtocol {
+    pub scheme: String,
+    pub secure: bool,
+    pub fetchable: bool,
+}
+
+pub struct CustomProtocolBuilder(CustomProtocol);
+
+impl CustomProtocolBuilder {
+    /// Create a new custom protocol
+    pub fn new(scheme: impl Into<String>) -> Self {
+        Self(CustomProtocol {
+            scheme: scheme.into(),
+            secure: true,
+            fetchable: true,
+        })
+    }
+
+    /// Set if the protocol can be used by `fetch`
+    pub fn set_fetchable(mut self, fetchable: bool) -> Self {
+        self.0.fetchable = fetchable;
+        self
+    }
+
+    /// Set if the protocol can be used in a [secure context]
+    ///
+    /// [secure context]: https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts
+    pub fn set_secure(mut self, secure: bool) -> Self {
+        self.0.secure = secure;
+        self
+    }
+}
+
+impl From<CustomProtocolBuilder> for CustomProtocol {
+    fn from(value: CustomProtocolBuilder) -> Self {
+        value.0
+    }
 }
