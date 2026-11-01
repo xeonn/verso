@@ -234,9 +234,9 @@ jobs:
       - name: Install dependencies
         run: |
           brew install cmake
-          curl https://gstreamer.freedesktop.org/data/pkg/osx/1.26.5/gstreamer-1.0-1.26.5-universal.pkg -o runtime.pkg
+          curl -fL https://gstreamer.freedesktop.org/data/pkg/osx/1.26.11/gstreamer-1.0-1.26.11-universal.pkg -o runtime.pkg
           sudo installer -pkg runtime.pkg -target /
-          curl https://gstreamer.freedesktop.org/data/pkg/osx/1.26.5/gstreamer-1.0-devel-1.26.5-universal.pkg -o develop.pkg
+          curl -fL https://gstreamer.freedesktop.org/data/pkg/osx/1.26.11/gstreamer-1.0-devel-1.26.11-universal.pkg -o develop.pkg
           sudo installer -pkg develop.pkg -target /
 
       - name: Run sccache-cache
