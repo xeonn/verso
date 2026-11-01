@@ -69,21 +69,15 @@ tracing = []
 cfg_aliases = "0.2"
 
 [dependencies]
-arboard = "3.4.0"
 crossbeam-channel = "0.5"
 env_logger = "0.11"
 euclid = "0.22"
 getopts = "0.2.17"
-# gleam = "0.15"
-# glow = "0.16"
-# glutin = "0.32.0"
-# glutin-winit = "0.5.0"
 ipc-channel = { workspace = true }
 keyboard-types = { version = "0.8.3", features = ["webdriver", "serde"] }
 log = { workspace = true }
 raw-window-handle = { version = "0.6", features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
-sparkle = "0.1.26"
 thiserror = "2"
 winit = { version = "0.30.13", features = ["rwh_06"] }
 dpi = { workspace = true }
@@ -101,6 +95,7 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 tokio = { version = "1", features = ["full"] }
 bitflags = "2.9"
 surfman = "0.14"
+glow = "0.17"
 servo = { version = "0.7.0", features = [
   "brotli-compression-stream",
   "webcrypto",
@@ -130,10 +125,6 @@ objc2-app-kit = { version = "0.2", features = [
   "NSResponder",
   "NSWindow",
 ] }
-
-[[test]]
-name = "general"
-harness = false
 
 [profile.release-lto]
 inherits = "release"

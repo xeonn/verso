@@ -9232,15 +9232,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sparkle"
-version = "0.1.26"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74fc6c6346da9177de9894230716709c223c62adbf910a5c1e6096b2ee2e58e0"
-dependencies = [
- "gl_generator",
-]
-
-[[package]]
 name = "speexdsp-resampler"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10688,7 +10679,6 @@ dependencies = [
 name = "versoview"
 version = "0.0.9"
 dependencies = [
- "arboard",
  "bincode",
  "bitflags 2.13.2",
  "cargo-packager-resource-resolver",
@@ -10700,6 +10690,7 @@ dependencies = [
  "env_logger",
  "euclid",
  "getopts",
+ "glow",
  "headers",
  "http",
  "ipc-channel",
@@ -10719,7 +10710,6 @@ dependencies = [
  "serde",
  "serde_json",
  "servo",
- "sparkle",
  "surfman",
  "thiserror 2.0.21",
  "tokio",

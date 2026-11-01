@@ -112,7 +112,7 @@ impl Window {
 
     /// Pop up `menu` at `position` in the window, or at the cursor when it is `None`.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn show_native_menu(&self, menu: &Menu, position: Option<Position>) {
+    pub(crate) fn show_native_menu(&self, menu: &Menu, position: Option<Position>) {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
         let Ok(handle) = self.window.window_handle() else {
@@ -135,7 +135,7 @@ impl Window {
 
     /// Find the menu item the user clicked, if any, among the events queued while the menu was open.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn take_menu_selection<'a, T>(
+    pub(crate) fn take_menu_selection<'a, T>(
         &self,
         find: impl Fn(&str) -> Option<&'a T>,
     ) -> Option<&'a T> {

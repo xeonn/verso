@@ -12,8 +12,6 @@ pub mod errors;
 
 /// Utilities to handle keyboard inputs and states.
 pub mod keyboard;
-// /// Verso's rendering context.
-// pub mod rendering;
 /// Main entry types and functions.
 pub mod verso;
 /// Web view types to handle web browsing contexts.
@@ -21,8 +19,6 @@ pub mod webview;
 /// Verso's window types to handle Winit's window.
 pub mod window;
 pub use errors::{Error, Result};
-/// Utilities to write tests.
-// pub mod test;
 pub use verso::Verso;
 /// Re-exporting Winit for the sake of convenience.
 pub use winit;
