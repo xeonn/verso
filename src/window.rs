@@ -12,12 +12,11 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use serde::{Deserialize, Serialize};
 use servo::{
     AllowOrDenyRequest, AuthenticationRequest, Cursor, DeviceIndependentPixel, DeviceIntRect,
-    DevicePixel, DevicePoint, EmbedderControl, EmbedderControlId, FilePicker,
-    InputEvent, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseLeftViewportEvent, MouseMoveEvent, NavigationRequest, Notification,
-    OffscreenRenderingContext, PermissionRequest, PromptDialog, RenderingContext, SimpleDialog,
-    WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WebViewId, WheelDelta, WheelEvent,
-    WheelMode, WindowRenderingContext,
+    DevicePixel, DevicePoint, EmbedderControl, EmbedderControlId, FilePicker, InputEvent,
+    LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
+    MouseMoveEvent, NavigationRequest, Notification, OffscreenRenderingContext, PermissionRequest,
+    PromptDialog, RenderingContext, SimpleDialog, WebResourceLoad, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewId, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 use versoview_messages::ToControllerMessage;
 #[cfg(any(linux, target_os = "windows"))]
@@ -193,7 +192,7 @@ impl WindowWebViewDelegate {
             Err(error) => {
                 log::debug!("Skipping a web resource the controller cannot see: {error}");
                 return;
-            },
+            }
         };
         if sender
             .send(ToControllerMessage::OnWebResourceRequested(
@@ -254,7 +253,12 @@ impl WebViewDelegate for WindowWebViewDelegate {
 
     fn request_permission(&self, webview: WebView, request: PermissionRequest) {
         self.with_window(|window, verso| {
-            window.show_prompt(verso, webview.id(), None, PendingPrompt::Permission(request))
+            window.show_prompt(
+                verso,
+                webview.id(),
+                None,
+                PendingPrompt::Permission(request),
+            )
         });
     }
 
@@ -281,7 +285,7 @@ impl WebViewDelegate for WindowWebViewDelegate {
                     window.handle_verso_page_prompt(verso, webview.id(), dialog)
                 });
                 return;
-            },
+            }
             other => other,
         };
         self.with_window(|window, verso| {
@@ -303,16 +307,19 @@ struct PanelWebViewDelegate(WindowWebViewDelegate);
 
 impl WebViewDelegate for PanelWebViewDelegate {
     fn notify_new_frame_ready(&self, webview: WebView) {
-        self.0.with_window(|window, _| window.mark_dirty(webview.id()));
+        self.0
+            .with_window(|window, _| window.mark_dirty(webview.id()));
     }
 
     fn notify_cursor_changed(&self, _webview: WebView, cursor: Cursor) {
-        self.0.with_window(|window, _| window.set_cursor_icon(cursor));
+        self.0
+            .with_window(|window, _| window.set_cursor_icon(cursor));
     }
 
     fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
         if status == LoadStatus::Complete {
-            self.0.with_window(|window, verso| window.finish_panel_load(verso));
+            self.0
+                .with_window(|window, verso| window.finish_panel_load(verso));
         }
     }
 
@@ -342,11 +349,13 @@ struct PromptWebViewDelegate(WindowWebViewDelegate);
 
 impl WebViewDelegate for PromptWebViewDelegate {
     fn notify_new_frame_ready(&self, webview: WebView) {
-        self.0.with_window(|window, _| window.mark_dirty(webview.id()));
+        self.0
+            .with_window(|window, _| window.mark_dirty(webview.id()));
     }
 
     fn notify_cursor_changed(&self, _webview: WebView, cursor: Cursor) {
-        self.0.with_window(|window, _| window.set_cursor_icon(cursor));
+        self.0
+            .with_window(|window, _| window.set_cursor_icon(cursor));
     }
 
     /// The prompt pages send their result with `window.alert(result)`.
@@ -357,7 +366,7 @@ impl WebViewDelegate for PromptWebViewDelegate {
                 alert.confirm();
                 self.0
                     .with_window(|window, _| window.finish_prompt(webview.id(), Some(&result)));
-            },
+            }
             EmbedderControl::InputMethod(input) => {
                 self.0.with_window(|window, verso| {
                     window.present_embedder_control(
@@ -366,7 +375,7 @@ impl WebViewDelegate for PromptWebViewDelegate {
                         EmbedderControl::InputMethod(input),
                     )
                 });
-            },
+            }
             other => log::debug!("Ignoring {:?} from a prompt page", other.id()),
         }
     }
@@ -521,6 +530,7 @@ impl Window {
         self.focused_webview_id = Some(id);
         self.resize_webviews();
         self.mark_region_dirty(Region::Content);
+        self.mark_region_dirty(Region::Panel);
     }
 
     /// Close a tab. `from_panel` is true when the panel already removed the tab from its strip.
@@ -531,7 +541,11 @@ impl Window {
         if self.tab_manager.tab(tab_id).is_none() {
             return;
         }
-        if self.prompt.as_ref().is_some_and(|prompt| prompt.parent == tab_id) {
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.parent == tab_id)
+        {
             self.close_prompt();
         }
         let panel_tab_id = self.panel_tab_ids.remove(&tab_id);
@@ -628,20 +642,20 @@ impl Window {
         match event {
             WindowEvent::RedrawRequested => {
                 self.repaint();
-            },
+            }
             WindowEvent::Resized(size) => {
                 let size = PhysicalSize::new(size.width.max(1), size.height.max(1));
                 self.rendering_context.resize(size);
                 self.resize_webviews();
                 self.window.request_redraw();
-            },
+            }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 let scale = self.scale_for(*scale_factor);
                 for webview in self.all_webviews() {
                     webview.set_hidpi_scale_factor(scale);
                 }
                 self.resize_webviews();
-            },
+            }
             WindowEvent::CursorLeft { .. } => {
                 if let Some(id) = self.hovering_webview.take()
                     && let Some(webview) = self.webview_cloned(id)
@@ -650,7 +664,7 @@ impl Window {
                         MouseLeftViewportEvent::default(),
                     ));
                 }
-            },
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_position.set(Some(*position));
                 let point = DevicePoint::new(position.x as f32, position.y as f32);
@@ -679,7 +693,7 @@ impl Window {
                         self.set_drag_resize_cursor(direction);
                     }
                 }
-            },
+            }
             WindowEvent::MouseInput { state, button, .. } => {
                 let Some(position) = self.mouse_position.get() else {
                     log::trace!("Mouse position is None, skipping MouseInput event.");
@@ -720,14 +734,14 @@ impl Window {
                     button,
                     local.into(),
                 )));
-            },
+            }
             WindowEvent::PinchGesture { delta, .. } => {
                 let center = self.mouse_position.get().unwrap_or_default();
                 let point = DevicePoint::new(center.x as f32, center.y as f32);
                 if let Some((webview, local)) = self.hit_test(point) {
                     webview.adjust_pinch_zoom(*delta as f32, local);
                 }
-            },
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let Some(position) = self.mouse_position.get() else {
                     log::trace!("Mouse position is None, skipping MouseWheel event.");
@@ -741,10 +755,10 @@ impl Window {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => {
                         let line = LINE_HEIGHT * self.scale_factor();
                         (*x as f64 * line, *y as f64 * line, WheelMode::DeltaLine)
-                    },
+                    }
                     winit::event::MouseScrollDelta::PixelDelta(position) => {
                         (position.x, position.y, WheelMode::DeltaPixel)
-                    },
+                    }
                 };
                 // Scroll one axis at a time.
                 if dy.abs() >= dx.abs() {
@@ -764,7 +778,7 @@ impl Window {
                         local.into(),
                     )));
                 }
-            },
+            }
             WindowEvent::ModifiersChanged(modifier) => self.modifiers_state.set(modifier.state()),
             WindowEvent::KeyboardInput { event, .. } => {
                 let event = keyboard_event_from_winit(event, self.modifiers_state.get());
@@ -775,13 +789,13 @@ impl Window {
                 if let Some(webview) = self.focused_or_current() {
                     webview.notify_input_event(InputEvent::Keyboard(event));
                 }
-            },
+            }
             WindowEvent::ThemeChanged(theme) => {
                 let theme = to_servo_theme(Some(theme));
                 for webview in self.all_webviews() {
                     webview.notify_theme_change(theme);
                 }
-            },
+            }
             _ => log::trace!("Verso Window isn't supporting this window event yet: {event:?}"),
         }
     }
@@ -801,13 +815,13 @@ impl Window {
                 (modifiers, Code::KeyT) if modifiers == control_or_meta => {
                     self.create_tab(verso, url::Url::parse("https://example.com").unwrap());
                     return true;
-                },
+                }
                 (modifiers, Code::KeyW) if modifiers == control_or_meta => {
                     if let Some(tab_id) = self.tab_manager.current_tab_id() {
                         self.close_tab(tab_id, false);
                     }
                     return true;
-                },
+                }
                 _ => (),
             }
         }
@@ -879,7 +893,7 @@ impl Window {
                     ),
                     (prompt.width as i32, prompt.height as i32),
                 )
-            },
+            }
         };
         euclid::default::Rect::new(origin.into(), size.into())
     }
@@ -977,6 +991,16 @@ impl Window {
             Region::Prompt => &self.prompt_dirty,
         };
         if dirty.take() {
+            // A new tab changes the chrome height, and Servo replaces the offscreen
+            // framebuffer. Its destructor binds framebuffer 0 and the resize blit can
+            // leave GL_INVALID_OPERATION. WebRender reports that on its next query and
+            // aborts the debug build. Bind this region's framebuffer and drop the error
+            // first.
+            if let Some(context) = context.as_ref() {
+                let _ = context.make_current();
+                context.prepare_for_rendering();
+            }
+            self.discard_gl_errors();
             webview.paint();
         }
         let Some(blit) = context
@@ -985,6 +1009,11 @@ impl Window {
         else {
             return;
         };
+        // Servo's blit clears the framebuffer that is currently bound, and only then
+        // switches the draw target to the window. `paint` leaves the offscreen
+        // framebuffer bound. The content rectangle covers that framebuffer, so the
+        // clear erases the page. Bind the window first and the clear lands there.
+        self.rendering_context.prepare_for_rendering();
         blit(
             self.rendering_context.glow_gl_api().as_ref(),
             self.gl_target_rect(region),
@@ -994,6 +1023,12 @@ impl Window {
     /// Size every webview to its region. Resizing one tab resizes the shared content context,
     /// and with it every other tab.
     fn resize_webviews(&mut self) {
+        let _ = self.rendering_context.make_current();
+        // Servo blits out of whichever framebuffer is current. WebRender may have left the
+        // read buffer unset for that framebuffer, which makes the resize blit fail.
+        self.prepare_offscreen_for_copy(self.panel_context.as_deref());
+        self.prepare_offscreen_for_copy(self.content_context.as_deref());
+        self.discard_gl_errors();
         if let Some(panel) = &self.panel {
             panel.webview.resize(self.panel_size());
         }
@@ -1001,7 +1036,40 @@ impl Window {
             tab.webview().resize(self.content_size());
         }
         if let Some(prompt) = &self.prompt {
+            self.prepare_offscreen_for_copy(Some(prompt.rendering_context.as_ref()));
             prompt.webview.resize(self.prompt_size());
+        }
+        self.panel_dirty.set(true);
+        self.content_dirty.set(true);
+        self.prompt_dirty.set(true);
+        self.discard_gl_errors();
+        self.window.request_redraw();
+    }
+
+    /// Bind `context` and select its color attachment, so a later framebuffer blit can read it.
+    fn prepare_offscreen_for_copy(&self, context: Option<&OffscreenRenderingContext>) {
+        let Some(context) = context else {
+            return;
+        };
+        use glow::HasContext as _;
+        context.prepare_for_rendering();
+        let gl = context.glow_gl_api();
+        unsafe {
+            gl.read_buffer(glow::COLOR_ATTACHMENT0);
+            gl.draw_buffer(glow::COLOR_ATTACHMENT0);
+        }
+    }
+
+    /// Drop a GL error left by Servo's framebuffer resize so WebRender does not abort on it.
+    fn discard_gl_errors(&self) {
+        use glow::HasContext as _;
+        let gl = self.rendering_context.glow_gl_api();
+        unsafe {
+            for _ in 0..8 {
+                if gl.get_error() == glow::NO_ERROR {
+                    break;
+                }
+            }
         }
     }
 
@@ -1056,7 +1124,11 @@ impl Window {
     fn focused_or_current(&self) -> Option<WebView> {
         self.focused_webview_id
             .and_then(|id| self.webview_cloned(id))
-            .or_else(|| self.tab_manager.current_tab().map(|tab| tab.webview().clone()))
+            .or_else(|| {
+                self.tab_manager
+                    .current_tab()
+                    .map(|tab| tab.webview().clone())
+            })
             .or_else(|| self.panel.as_ref().map(|panel| panel.webview.clone()))
     }
 
@@ -1064,7 +1136,10 @@ impl Window {
         if self.focused_webview_id == Some(id) {
             return;
         }
-        if let Some(old) = self.focused_webview_id.and_then(|old| self.webview_cloned(old)) {
+        if let Some(old) = self
+            .focused_webview_id
+            .and_then(|old| self.webview_cloned(old))
+        {
             old.set_focused(false);
         }
         if let Some(webview) = self.webview_cloned(id) {
@@ -1128,9 +1203,7 @@ impl Window {
             if self.panel.is_some() && is_http(&request.url) {
                 let id = uuid::Uuid::new_v4();
                 verso.check_download(request.url.clone(), DownloadCheckFollowUp::Navigation(id));
-                self.event_listeners
-                    .pending_navigations
-                    .insert(id, request);
+                self.event_listeners.pending_navigations.insert(id, request);
                 return None;
             }
             return Some(request);
@@ -1143,9 +1216,7 @@ impl Window {
             log::error!("Verso failed to send OnNavigationStarting to controller: {error}");
             return Some(request);
         }
-        self.event_listeners
-            .pending_navigations
-            .insert(id, request);
+        self.event_listeners.pending_navigations.insert(id, request);
         None
     }
 
@@ -1171,12 +1242,12 @@ impl Window {
                 if self.event_listeners.pending_navigations.contains_key(id) {
                     self.answer_navigation(*id, proceed);
                 }
-            },
+            }
             DownloadCheckFollowUp::Load(tab_id) => {
                 if proceed && let Some(tab) = self.tab_manager.tab(*tab_id) {
                     tab.webview().load(url.clone());
                 }
-            },
+            }
         }
     }
 
@@ -1252,7 +1323,7 @@ impl Window {
                     dialog.set_current_value(&value);
                 }
                 dialog.confirm();
-            },
+            }
             EmbedderControl::SimpleDialog(dialog) => dialog.confirm(),
             other => self.present_embedder_control(verso, panel_id, other),
         }
@@ -1276,18 +1347,18 @@ impl Window {
                     SimpleDialog::Prompt(dialog) => PendingPrompt::Input(dialog),
                 };
                 self.show_prompt(verso, webview_id, Some(control_id), pending);
-            },
+            }
             EmbedderControl::InputMethod(input) => {
                 if input.allow_virtual_keyboard() {
                     self.ime_control = Some(input.id());
                     self.show_ime(webview_id, input.position());
                 }
-            },
+            }
             EmbedderControl::ColorPicker(_) => {
                 // No native color picker is available. Dropping the control keeps the
                 // current color.
                 log::debug!("Color pickers are not supported yet");
-            },
+            }
         }
     }
 
@@ -1337,7 +1408,12 @@ impl Window {
         webview.resize(size);
         webview.notify_theme_change(self.servo_theme());
         let id = webview.id();
-        log::debug!("Verso Window {:?} shows prompt {} for tab {}", self.id(), id, parent);
+        log::debug!(
+            "Verso Window {:?} shows prompt {} for tab {}",
+            self.id(),
+            id,
+            parent
+        );
         self.prompt = Some(Prompt {
             webview,
             rendering_context: context,
@@ -1388,31 +1464,31 @@ impl Window {
                 if let Some(webview) = current {
                     let _ = webview.go_back(1);
                 }
-            },
+            }
             "FORWARD" => {
                 if let Some(webview) = current {
                     let _ = webview.go_forward(1);
                 }
-            },
+            }
             "REFRESH" => {
                 if let Some(webview) = current {
                     webview.reload();
                 }
-            },
+            }
             "MINIMIZE" => {
                 let _ = self.window.set_minimized(true);
-            },
+            }
             "MAXIMIZE" | "DBCLICK_PANEL" => self.window.set_maximized(!self.window.is_maximized()),
             "DRAG_WINDOW" => {
                 if let Err(error) = self.window.drag_window() {
                     log::warn!("Failed to drag the window: {error}");
                 }
-            },
+            }
             "NEW_WINDOW" => {
                 if let Err(error) = self.proxy.send_event(EventLoopProxyMessage::NewWindow) {
                     log::error!("Failed to request a new window: {error}");
                 }
-            },
+            }
             "BOOKMARK" => {
                 let tab = self.tab_manager.current_tab()?;
                 let url = tab.webview().url()?;
@@ -1422,11 +1498,11 @@ impl Window {
                 }
                 self.update_bookmark_bar(verso);
                 return Some(verso.bookmarks_json());
-            },
+            }
             "UPDATE_BOOKMARK" => {
                 self.update_bookmark_bar(verso);
                 return Some(verso.bookmarks_json());
-            },
+            }
             "OPEN_BOOKMARK_MANAGER" => self.create_tab(
                 verso,
                 url::Url::parse("verso://resources/components/bookmark.html").unwrap(),
@@ -1440,30 +1516,30 @@ impl Window {
                 match self.tab_manager.current_tab_id() {
                     Some(tab_id) if is_http(&url) => {
                         verso.check_download(url, DownloadCheckFollowUp::Load(tab_id));
-                    },
+                    }
                     Some(_) => current?.load(url),
                     None => self.create_tab(verso, url),
                 }
-            },
+            }
             other if other.starts_with("ACTIVATE_TAB:") => {
                 let payload = other.trim_start_matches("ACTIVATE_TAB:");
                 if let Some(tab_id) = self.parse_panel_tab(payload) {
                     self.activate_tab(tab_id, self.tab_manager.count() > 1);
                 }
-            },
+            }
             other if other.starts_with("CLOSE_TAB:") => {
                 let payload = other.trim_start_matches("CLOSE_TAB:");
                 if let Some(tab_id) = self.parse_panel_tab(payload) {
                     self.close_tab(tab_id, true);
                 }
-            },
+            }
             other if other.starts_with("OPEN_HISTORY_MENU:") => {
                 let payload = other.trim_start_matches("OPEN_HISTORY_MENU:");
                 match serde_json::from_str::<OpenHistoryMenuRequest>(payload) {
                     Ok(request) => self.show_history_menu(request),
                     Err(error) => log::error!("Invalid history menu request {payload:?}: {error}"),
                 }
-            },
+            }
             _ => log::debug!("Ignoring panel prompt: {message}"),
         }
         None
@@ -1473,10 +1549,9 @@ impl Window {
     fn parse_panel_tab(&self, payload: &str) -> Option<WebViewId> {
         let value: serde_json::Value = serde_json::from_str(payload).ok()?;
         let id = &value["id"];
-        let panel_tab_id: PanelTabId = serde_json::from_value(id.clone()).ok().or_else(|| {
-            id.as_str()
-                .and_then(|text| serde_json::from_str(text).ok())
-        })?;
+        let panel_tab_id: PanelTabId = serde_json::from_value(id.clone())
+            .ok()
+            .or_else(|| id.as_str().and_then(|text| serde_json::from_str(text).ok()))?;
         self.panel_tab_ids
             .iter()
             .find(|(_, id)| **id == panel_tab_id)
@@ -1751,7 +1826,7 @@ fn parse_navigation_url(text: &str) -> Option<url::Url> {
         Err(error) => {
             log::warn!("Navigation URL {text:?} is invalid: {error}");
             None
-        },
+        }
     }
 }
 

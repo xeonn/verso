@@ -10690,6 +10690,7 @@ dependencies = [
  "env_logger",
  "euclid",
  "getopts",
+ "glow",
  "headers",
  "http",
  "ipc-channel",
