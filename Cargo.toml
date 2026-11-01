@@ -6,7 +6,7 @@ version = "0.0.9"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 homepage = "https://versotile.org/verso"
-repository = "https://github.com/versotile-org/verso"
+repository = "https://github.com/xeonn/verso"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

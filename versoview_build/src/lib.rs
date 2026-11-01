@@ -96,7 +96,7 @@ pub fn default_output_directory() -> PathBuf {
         .to_path_buf()
 }
 
-/// Default archive base URL: <https://github.com/tauri-apps/verso/releases>
+/// Default archive base URL: <https://github.com/xeonn/verso/releases>
 pub const fn default_archive_base_url() -> &'static str {
-    "https://github.com/tauri-apps/verso/releases"
+    "https://github.com/xeonn/verso/releases"
 }
