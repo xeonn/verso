@@ -3,6 +3,9 @@ name: Release VersoView
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 env:
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0

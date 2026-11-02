@@ -277,6 +277,20 @@ impl WebViewDelegate for WindowWebViewDelegate {
         // Verso's own pages (`verso://`) talk to Verso through `window.prompt("VERSO::...")`.
         // Pages from the web must not reach that channel.
         let control = match control {
+            // Any page may ask to drag the window. `prompt` runs during the mouse-down
+            // turn, which is when macOS still has the event `performWindowDragWithEvent` needs.
+            // A round trip through the Tauri controller arrives too late.
+            EmbedderControl::SimpleDialog(SimpleDialog::Prompt(dialog))
+                if dialog.message().trim() == "VERSO::DRAG_WINDOW" =>
+            {
+                self.with_window(|window, _| {
+                    dialog.confirm();
+                    if let Err(error) = window.window.drag_window() {
+                        log::warn!("Failed to drag the window: {error}");
+                    }
+                });
+                return;
+            }
             EmbedderControl::SimpleDialog(SimpleDialog::Prompt(dialog))
                 if dialog.message().starts_with("VERSO::")
                     && webview.url().is_some_and(|url| url.scheme() == "verso") =>
@@ -700,6 +714,20 @@ impl Window {
                     return;
                 };
                 let point = DevicePoint::new(position.x as f32, position.y as f32);
+
+                // No panel means the page is the window chrome. The transparent title bar
+                // sits on top of that page and `setMovable(false)` stops macOS from dragging it.
+                #[cfg(macos)]
+                if *state == ElementState::Pressed
+                    && *button == winit::event::MouseButton::Left
+                    && self.panel.is_none()
+                    && position.y < self.embedded_drag_band_px()
+                {
+                    if let Err(error) = self.window.drag_window() {
+                        log::warn!("Failed to drag the window: {error}");
+                    }
+                    return;
+                }
 
                 #[cfg(any(linux, target_os = "windows"))]
                 {
@@ -1770,6 +1798,45 @@ use objc2::runtime::AnyObject;
 use raw_window_handle::{AppKitWindowHandle, RawWindowHandle};
 #[cfg(macos)]
 use winit::dpi::LogicalPosition;
+
+#[cfg(macos)]
+impl Window {
+    /// Physical-pixel height of the top drag band on a window with no panel.
+    ///
+    /// The transparent title bar is about 28 points. Snake's score bar is 52 CSS
+    /// pixels, and it sits under that title bar, so the drag band has to cover both.
+    fn embedded_drag_band_px(&self) -> f64 {
+        let header = 52.0 * self.window.scale_factor();
+        self.macos_titlebar_height_px().max(header)
+    }
+
+    /// Height of the transparent title bar, in physical pixels.
+    fn macos_titlebar_height_px(&self) -> f64 {
+        let fallback = 28.0 * self.window.scale_factor();
+        let Ok(handle) = self.window.window_handle() else {
+            return fallback;
+        };
+        let RawWindowHandle::AppKit(AppKitWindowHandle { ns_view, .. }) = handle.as_ref() else {
+            return fallback;
+        };
+        unsafe {
+            use objc2::rc::Id;
+            use objc2_app_kit::NSView;
+            let Some(ns_view) = Id::retain(ns_view.as_ptr().cast::<NSView>()) else {
+                return fallback;
+            };
+            let Some(window) = ns_view.window() else {
+                return fallback;
+            };
+            let height = window.frame().size.height - window.contentLayoutRect().size.height;
+            if height > 1.0 {
+                height * self.window.scale_factor()
+            } else {
+                fallback
+            }
+        }
+    }
+}
 
 /// Window decoration for macOS.
 #[cfg(macos)]
